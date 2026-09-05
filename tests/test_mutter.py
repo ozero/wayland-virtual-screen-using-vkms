@@ -116,6 +116,30 @@ class TestHappyPath(RecordMonitorTestCase):
         self.assertEqual(self.errors, [])
         self.assertNotIn("Stop", self.bus.methods())
 
+    def test_stream_signal_before_start_reply_keeps_the_recording_alive(self):
+        """PipeWireStreamAdded が Start の応答より先に届く順序。
+
+        購読を Start より先に行っている以上この順序は起こりうる。成功したあとに
+        Start の応答が届いても、渡したばかりのセッションを止めてはいけない。
+        """
+        self.start()
+        self.bus.find("CreateSession")[0]["callback"](
+            None, self.reply_object("/session/u1"))
+        self.bus.find("RecordMonitor")[0]["callback"](
+            None, self.reply_object("/stream/u1"))
+        sub = next(iter(self.bus.subscriptions.values()))
+
+        # Start の応答より先にシグナルが届く
+        sub["callback"](None, None, "/stream/u1", None, "PipeWireStreamAdded",
+                        GLib.Variant("(u)", (75,)))
+        self.assertEqual(len(self.ready), 1)
+        self.assertEqual(self.ready[0].node_id, 75)
+
+        # そのあとに Start の成功応答が届いても Stop してはいけない
+        self.bus.find("Start")[0]["callback"](None, None)
+        self.assertNotIn("Stop", self.bus.methods())
+        self.assertEqual(self.errors, [])
+
 
 class TestTimeoutRace(RecordMonitorTestCase):
     def test_late_create_reply_stops_the_orphaned_session(self):

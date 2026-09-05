@@ -85,13 +85,14 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
     失敗時は on_error(Exception) を呼ぶ。inhibit なら InhibitedError が渡る。
     GLib のメインループが回っていることが前提。
     """
-    state = {"done": False, "session_path": None, "stream_path": None,
-             "subscription": None, "timeout_id": None}
+    state = {"done": False, "aborted": False, "session_path": None,
+             "stream_path": None, "subscription": None, "timeout_id": None}
 
     def finish_error(exc):
         if state["done"]:
             return
         state["done"] = True
+        state["aborted"] = True
         _cleanup(bus, state)
         on_error(exc)
 
@@ -139,7 +140,7 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         except GLib.Error as err:
             finish_error(_wrap_error(err))
             return
-        if state["done"]:
+        if state["aborted"]:
             abandon()
 
     def on_record_done(_source, res):
@@ -148,7 +149,7 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         except GLib.Error as err:
             finish_error(_wrap_error(err))
             return
-        if state["done"]:
+        if state["aborted"]:
             abandon()
             return
         state["stream_path"] = reply.unpack()[0]
@@ -168,7 +169,7 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
             finish_error(_wrap_error(err))
             return
         session_path = reply.unpack()[0]
-        if state["done"]:
+        if state["aborted"]:
             # 打ち切った後に作られたセッション。放置すると誰も止められない。
             abandon(session_path)
             return
