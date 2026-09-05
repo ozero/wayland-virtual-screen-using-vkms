@@ -95,6 +95,23 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         _cleanup(bus, state)
         on_error(exc)
 
+    def abandon(session_path=None):
+        """打ち切ったあとに遅れて届いた応答の後始末。
+
+        タイムアウトやエラーで打ち切ったあとに Mutter の応答が届くと、こちらが
+        知らないままセッションが走り続ける(=「画面共有中」の表示が消えない)。
+        常駐デーモンではプロセス終了による後始末も効かないので、遅れて判明した
+        セッションはここで明示的に止める。
+        """
+        path = session_path or state["session_path"]
+        if state["subscription"] is not None:
+            bus.signal_unsubscribe(state["subscription"])
+            state["subscription"] = None
+        if path is not None:
+            bus.call(SCREEN_CAST_NAME, path, SESSION_IFACE, "Stop", None, None,
+                     Gio.DBusCallFlags.NONE, -1, None, None)
+        state["session_path"] = None
+
     def finish_ok(node_id):
         if state["done"]:
             return
@@ -121,12 +138,18 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
             bus.call_finish(res)
         except GLib.Error as err:
             finish_error(_wrap_error(err))
+            return
+        if state["done"]:
+            abandon()
 
     def on_record_done(_source, res):
         try:
             reply = bus.call_finish(res)
         except GLib.Error as err:
             finish_error(_wrap_error(err))
+            return
+        if state["done"]:
+            abandon()
             return
         state["stream_path"] = reply.unpack()[0]
         # Start より先に購読する。順序を逆にすると取りこぼす。
@@ -144,7 +167,12 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         except GLib.Error as err:
             finish_error(_wrap_error(err))
             return
-        state["session_path"] = reply.unpack()[0]
+        session_path = reply.unpack()[0]
+        if state["done"]:
+            # 打ち切った後に作られたセッション。放置すると誰も止められない。
+            abandon(session_path)
+            return
+        state["session_path"] = session_path
         props = {"cursor-mode": GLib.Variant("u", protocol.to_mutter_cursor_mode(cursor_mode))}
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "RecordMonitor", GLib.Variant("(sa{sv})", (connector, props)),
