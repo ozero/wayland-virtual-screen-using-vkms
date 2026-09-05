@@ -199,14 +199,28 @@ org.gnome.Mutter.ScreenCast.CreateSession({})           -> /org/gnome/Mutter/Scr
 
 ### 4.2 P0-1: inhibit 要因の特定
 
-1. いま P0-2 を実行 → 通るか（現時点で inhibit されているか）
-2. 15分放置して画面ブランク後に P0-2 を再実行 → 比較
-3. `gsettings set org.gnome.desktop.session idle-delay 0` にして再度放置 → 再実行
+`lock-enabled = false` なのでロック画面は除外済み。残る候補は2つあり、**両者は別のトリガ**
+なので分けて試す。
+
+- **候補A: gnome-shell のアイドル画面ブランク**（`idle-delay = 900`）。gnome-shell 側の状態変化
+- **候補B: 物理モニタの電源 OFF による connector 切断**。DRM 側の状態変化。Mutter から
+  見えるモニタ集合が `{DP-1, Virtual-1}` → `{Virtual-1}` に変わる
+
+各状態で `screencast-probe.py`（4.1）を実行する:
+
+| 状態 | 作り方 | 分かること |
+|---|---|---|
+| S0 通常 | 何もしない | 通らなければ inhibit は**恒久的** |
+| S1 DP-1 電源 OFF | モニタの電源ボタンを押す（即時） | 候補B の検証 |
+| S2 アイドルブランク後 | `idle-delay` を一時的に `60` にして1分放置 | 候補A の検証。**15分待つ必要はない** |
+| S3 S1 + S2 | 電源 OFF のまま1分放置 | 実運用に最も近い状態 |
+
+`idle-delay` は検証後に元の `900` へ戻す（候補A が当たりなら `0` にするのが対処）。
 
 並行して gnome-shell の JS リソースから `inhibit_remote_access` の呼び出し元を特定する。
 `libgnome-shell.so` からは gresource を列挙できなかったので、リソースの所在の再探索が必要。
 
-当たれば **gsettings 1行で解決**する。
+候補A が当たれば **gsettings 1行で解決**する。
 
 ### 4.3 P0-3: app_id の付与
 
@@ -229,7 +243,7 @@ org.gnome.Mutter.ScreenCast.CreateSession({})           -> /org/gnome/Mutter/Scr
 | 通る | 直る | — | **コード不要**。gsettings のみで完了 |
 | 通る | 直らない | 直らない | **Phase 1 を実装**（層3で UI を消す） |
 | 通らない | 要因判明→解除可 | — | 解除してから再判定 |
-| 通らない | 要因不明 | — | **Phase 1 も不可**。保留案 C を再検討（8.2） |
+| 通らない | 要因不明 | — | **Phase 1 も不可**。inhibit の発生源を gnome-shell 側で特定して無効化する方向へ切り替える（C は却下済み: 8.2） |
 
 ---
 
@@ -419,7 +433,7 @@ systemd user unit（`~/.config/systemd/user/portal-autoapprove.service`、
 
 ## 8. 検討した他の案
 
-B / D / Flatpak 化は却下、C は保留（Phase 0 の結果次第で再検討）。
+B / C / D / Flatpak 化のすべてを却下した。C は 2026-09-06 に実機で試した上での却下。
 
 ### 8.1 B. ダイアログを自動クリック（AT-SPI）
 
@@ -430,13 +444,19 @@ B / D / Flatpak 化は却下、C は保留（Phase 0 の結果次第で再検討
 - 日本語ラベル・フォーカス・タイミングに依存し、GNOME 更新で壊れる
 - **層1の inhibit も xdp-gnome の SEGV も解決しない**（押せてもセッションが作れない）
 
-### 8.2 C. gnome-remote-desktop（RDP）へ乗り換え
+### 8.2 C. gnome-remote-desktop（RDP）へ乗り換え — 実測で却下
 
 ポータルを通らないので**ダイアログが構造的に存在しない**。46.3 が既にインストール済みで
-コード不要。Tailscale 上（`100.123.232.87`）なので接続性の問題もない。
+コード不要。Tailscale 上（`100.123.232.87`）なので接続性の問題もない。当初は保留（Phase 0 で
+層1が塞がったままなら再検討）としていたが、**2026-09-06 に実機で試して却下**した。
 
-却下ではなく**保留**。Phase 0 で層1が塞がったままなら再検討する。RustDesk の ID 接続・
-中継・ファイル転送を失うため、今回は第一候補にしない。
+**却下理由: 同じユーザ名の既存セッションを終了しないと利用できない。**
+gnome-remote-desktop の RDP は手元でログイン中のセッションにアタッチせず別セッションを
+作るため、既存セッションと衝突する。
+
+これは本構成の目的と根本的に相容れない。VKMS 構成は「物理モニタが消えても**同じセッションが
+生き続ける**」ことを狙っているのに対し、RDP は別セッションを立てる。前提が違う。
+RustDesk の ID 接続・中継・ファイル転送を失う点は、この時点では議論するまでもない。
 
 ### 8.3 D. xdg-desktop-portal-gnome にパッチを当てて自動承認ビルド
 
@@ -473,7 +493,9 @@ B / D / Flatpak 化は却下、C は保留（Phase 0 の結果次第で再検討
 2. **`portals.conf` の実効ファイル名**。`XDG_CURRENT_DESKTOP=ubuntu:GNOME` なので xdp は
    各設定ディレクトリで `ubuntu-portals.conf` → `gnome-portals.conf` → `portals.conf` の順に
    探す。どれが実際に読まれるかは journal で確認して確定する
-3. **inhibit の要因**（4.2）。特定できれば Phase 1 が不要になる可能性がある
+3. **inhibit の要因**（4.2）。特定できれば Phase 1 が不要になる可能性がある。
+   逆に S0（通常状態）でも通らなければ inhibit は恒久的で、**Phase 1 を含む全案が成立しない**。
+   その場合は gnome-shell 側の発生源特定が唯一の道になる
 4. **`app-*.scope` での app_id 付与**（4.3）が実際に効くか
 5. **xdp-gnome の SEGV**（2.4）。Phase 1 では該当経路を通らなくなるため実害は消えるが、
    中継パス（5.1）では依然通るので、再現条件を記録しておく
