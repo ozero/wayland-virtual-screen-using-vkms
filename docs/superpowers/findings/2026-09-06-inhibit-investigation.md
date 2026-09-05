@@ -26,9 +26,9 @@ xdg-desktop-portal-gnome: Error restoring stream from session:
 | 状態 | 作り方 | 時刻 | probe の結果 | exit |
 |---|---|---|---|---|
 | S0 通常 | 何もしない | 01:46:23 | `成功: node_id=75` | 0 |
-| S1 DP-1 電源 OFF | モニタの電源ボタン | | | |
-| S2 アイドルブランク後 | `idle-delay` を 60 にして1分放置 | | | |
-| S3 S1 + S2 | 電源 OFF のまま1分放置 | | | |
+| S1 DP-1 電源 OFF | モニタの電源ボタン | 01:47:11 | `成功: node_id=75` | 0 |
+| S2 アイドルブランク後 | （S3 と同時に測定。下記参照） | — | — | — |
+| S3 S1 + S2 | 電源 OFF のまま `idle-delay` 60 で放置 | 01:52 | **`失敗: セッション作成が inhibit されている`** | 2 |
 
 ### S0 の詳細
 
@@ -44,14 +44,121 @@ connectors: Virtual-1, DP-1
 **S0 が成功した時点で「inhibit は恒久的ではない」ことが確定した。**
 9月4日の inhibit には何らかのトリガ条件がある。
 
-## app_id 検証 (P0-3)
+### S1 の詳細
+
+```
+/sys/class/drm/card0-Virtual-1/status    connected
+/sys/class/drm/card1-DP-1/status         disconnected
+
+connectors: Virtual-1
+  Virtual-1    position=(0, 0) size=3840x2160
+
+記録対象: Virtual-1 position=(0, 0) size=3840x2160
+成功: node_id=75
+```
+
+**物理モニタの電源 OFF は inhibit のトリガではない。**
+DP-1 の connector が消えても Virtual-1 は 3840x2160 を維持しており
+（`monitors.xml` の `{Virtual-1}` 単独構成が効いている）、ScreenCast も通る。
+
+### S3 の詳細 — **inhibit の再現に成功**
+
+`idle-delay` を一時的に 60 秒にして放置し、`ScreenSaver.GetActive` が `true`
+（＝画面ブランク／スクリーンシールドが立った状態）になった時点で探針を実行した。
+
+```
+--- 条件成立 t=20s idle=64ms ScreenSaver.GetActive=(true,) ---
+記録対象: Virtual-1 position=(0, 0) size=3840x2160
+失敗: セッション作成が inhibit されている
+  GDBus.Error:org.freedesktop.DBus.Error.Failed: Session creation inhibited
+exit=2
+=== 探針直後の状態 ===
+idle=(uint64 143073,) active=(true,)
+```
+
+## 結論: アイドル画面ブランクが inhibit の原因
+
+| 状態 | DP-1 | 画面ブランク | 結果 |
+|---|---|---|---|
+| S0 | 点灯 | なし | 成功 |
+| S1 | **消灯** | なし | 成功 |
+| S3 | 消灯 | **あり** | **inhibit** |
+
+S1 と S3 の差分はブランクの有無だけなので、**トリガは gnome-shell のアイドル画面ブランク
+（スクリーンシールド）**で確定。`lock-enabled=false` でもシールドは立つため、ロックを
+無効にしていても発生する。
+
+これが 2026-09-04 に RustDesk の restore が失敗していた理由である。無人運用のマシンは
+接続と接続のあいだ必ずアイドルになるので、**毎回ダイアログが出る**という症状と整合する。
+
+## 対処の検証: `idle-delay = 0`
+
+画面を自動でブランクしなければシールドが立たず inhibit も起きないはず、という仮説を検証した。
+
+```
+--- idle-delay を 0 に設定 ---
+t= 30s  active=(false,)
+t= 60s  active=(false,)
+t= 90s  active=(false,)
+t=120s  active=(false,)
+t=150s  active=(false,)
+=== 探針 (idle-delay=0、長時間アイドル後) ===
+記録対象: Virtual-1 position=(0, 0) size=3840x2160
+成功: node_id=75
+exit=0
+最終状態: active=(false,) idle=(uint64 210359,)
+```
+
+210 秒アイドルでもシールドが立たず、ScreenCast セッションが作れた。**対処として有効。**
+
+### 併せて確認した無人運用まわりの設定
+
+| 設定 | 値 | 評価 |
+|---|---|---|
+| `org.gnome.desktop.session idle-delay` | **`0`**（変更した） | ブランクしない = inhibit しない |
+| `org.gnome.desktop.screensaver lock-enabled` | `false` | ロック画面は出ない |
+| `…power sleep-inactive-ac-type` | `'nothing'` | アイドルでサスペンドしない |
+| logind `IdleAction` | `ignore` | 同上 |
+
+いずれも無人リモートアクセスに対して安全側。変更したのは `idle-delay` のみ。
+
+戻す場合: `gsettings set org.gnome.desktop.session idle-delay 900`
+
+## app_id 検証 (P0-3) — 保留
+
+設計書 2.5 で「RustDesk が system unit にいるため `app_id` が空文字列になり、restore token が
+permission store に正しく保管されない」ことを指摘していた。ただし 2026-09-04 のログでは
+`Error restoring stream from session` が出ており、**restore data 自体は見つかっていた**ので、
+app_id の問題は inhibit による失敗の結果であって独立した原因ではない可能性が高い。
+
+inhibit を解消した状態で RustDesk の通し確認を行い、それでもダイアログが出る場合にのみ
+P0-3 を実施する。
 
 | 確認項目 | 結果 |
 |---|---|
-| journal に `Assigning app ID` が出るか | |
-| `flatpak permissions screencast` にエントリが増えるか | |
-| 2回目の接続でダイアログが出ないか | |
+| journal に `Assigning app ID` が出るか | 未実施（保留） |
+| `flatpak permissions screencast` にエントリが増えるか | 未実施（保留） |
+| 2回目の接続でダイアログが出ないか | **要確認（受け入れテスト）** |
+
+## gnome-shell の呼び出し元特定 — 実施せず
+
+計画では `inhibit_remote_access` を呼んでいる JS を gresource から特定する手順を置いていたが、
+S1 と S3 の差分で「ブランクがトリガ」と確定できたため実施しなかった。呼び出し元の特定は
+対処には不要（確認的な情報にとどまる）。
 
 ## 結論
 
-（調査完了後に記入）
+**原因: gnome-shell のアイドル画面ブランク（スクリーンシールド）が remote access を
+inhibit し、Mutter が ScreenCast セッションの作成を拒否していた。**
+
+無人運用のマシンは接続と接続のあいだ必ずアイドルになるため、ほぼ毎回この状態になる。
+xdg-desktop-portal-gnome は restore に失敗するとダイアログにフォールバックするので、
+「RustDesk 接続のたびに毎回ダイアログが出る」という症状になっていた。
+
+**対処: `gsettings set org.gnome.desktop.session idle-delay 0`（適用済み）**
+
+設計書 4.4 の出口表では「S0 通る / P0-1 で直る」に該当し、**Phase 1（自作 ScreenCast
+バックエンド）は不要**。実装計画の Task 4 以降は実施しない。
+
+ただし最終判断は RustDesk での通し確認による。連続2回の接続でダイアログが出ないことを
+確認してから、README と handoff に反映して完了とする。それでも出る場合は P0-3（app_id）に進む。
