@@ -20,6 +20,13 @@
 - **公開プロパティ**（spec 5.3 より、逐語）: `AvailableSourceTypes = 1`（MONITOR のみ）、`AvailableCursorModes = 7`、`version = 5`
 - **差し替えるのは `org.freedesktop.impl.portal.ScreenCast` のみ。** RemoteDesktop / FileChooser / Secret 等は GNOME のまま。
 - **kill switch を壊さない。** `~/.config/xdg-desktop-portal/gnome-portals.conf` を削除して `systemctl --user restart xdg-desktop-portal` すれば必ず元の挙動に戻ること。
+- **PyGObject のコールバック規約**（3.48.2 で実測確認済み。守らないと `TypeError` になる）:
+  - `bus.call(..., cancellable, callback)` — 末尾に `user_data` を渡さないこと。コールバックは `(source, result)` の**2引数**
+  - `bus.signal_subscribe(..., callback)` — 同上。コールバックは `(connection, sender, path, interface, signal, params)` の**6引数**
+  - `bus.register_object(path, iface_info, method_call, get_property, set_property)` — `method_call` は
+    `(connection, sender, path, interface, method, params, invocation)` の**7引数**、`get_property` は
+    `(connection, sender, path, interface, property_name)` の**5引数**。どちらにも `user_data` も `error` も渡らない
+  - `register_object` の第5引数に `None` を渡すのは正しい（set_property であって user_data ではない）
 - **テスト実行**: リポジトリルートで `python3 -m unittest discover -s tests -t . -v`
 - 対象環境: Ubuntu 24.04 / GNOME 46 (mutter 46.2) / Wayland / xdg-desktop-portal 1.18.4 / xdg-desktop-portal-gnome 46.2 / `XDG_CURRENT_DESKTOP=ubuntu:GNOME`
 
@@ -506,7 +513,7 @@ class Recording:
         self._closed_subscription = self._bus.signal_subscribe(
             SCREEN_CAST_NAME, SESSION_IFACE, "Closed", self._session_path, None,
             Gio.DBusSignalFlags.NONE,
-            lambda *_args: callback(), None)
+            lambda *_args: callback())
 
     def stop(self):
         """セッションを閉じる。二重呼び出しは無害。"""
@@ -518,7 +525,7 @@ class Recording:
         path, self._session_path = self._session_path, None
         self._bus.call(
             SCREEN_CAST_NAME, path, SESSION_IFACE, "Stop", None, None,
-            Gio.DBusCallFlags.NONE, -1, None, None, None)
+            Gio.DBusCallFlags.NONE, -1, None, None)
 
 
 def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5000):
@@ -576,10 +583,10 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         state["subscription"] = bus.signal_subscribe(
             SCREEN_CAST_NAME, STREAM_IFACE, "PipeWireStreamAdded",
             state["stream_path"], None, Gio.DBusSignalFlags.NONE,
-            on_stream_added, None)
+            on_stream_added)
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "Start", None, None, Gio.DBusCallFlags.NONE, -1, None,
-                 on_start_done, None)
+                 on_start_done)
 
     def on_create_done(_source, res):
         try:
@@ -592,13 +599,13 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "RecordMonitor", GLib.Variant("(sa{sv})", (connector, props)),
                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-                 on_record_done, None)
+                 on_record_done)
 
     state["timeout_id"] = GLib.timeout_add(timeout_ms, on_timeout)
     bus.call(SCREEN_CAST_NAME, SCREEN_CAST_PATH, SCREEN_CAST_IFACE,
              "CreateSession", GLib.Variant("(a{sv})", ({},)),
              GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-             on_create_done, None)
+             on_create_done)
 
 
 def _cleanup(bus, state):
@@ -610,7 +617,7 @@ def _cleanup(bus, state):
         state["subscription"] = None
     if state["session_path"] is not None:
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
-                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None, None)
+                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None)
         state["session_path"] = None
 ```
 
@@ -1151,18 +1158,18 @@ class Backend:
 
         self._bus.call(self.name, PORTAL_PATH, SCREEN_CAST_IFACE, method,
                        params, REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                       on_done, None)
+                       on_done)
 
     def close_object(self, path, iface):
         """中継先の Session/Request の Close() を呼ぶ。応答は待たない。"""
         self._bus.call(self.name, path, iface, "Close", None, None,
-                       Gio.DBusCallFlags.NONE, -1, None, None, None)
+                       Gio.DBusCallFlags.NONE, -1, None, None)
 
     def subscribe_closed(self, session_path, callback):
         """中継先の Session が閉じたら callback() を呼ぶ。購読 ID を返す。"""
         return self._bus.signal_subscribe(
             self.name, SESSION_IFACE, "Closed", session_path, None,
-            Gio.DBusSignalFlags.NONE, lambda *_args: callback(), None)
+            Gio.DBusSignalFlags.NONE, lambda *_args: callback())
 
     def unsubscribe(self, subscription_id):
         self._bus.signal_unsubscribe(subscription_id)
@@ -1284,7 +1291,7 @@ class ScreenCastBackend:
 
     # ---- ScreenCast インターフェース ----
 
-    def _on_get_property(self, _conn, _sender, _path, _iface, name, _error, _data):
+    def _on_get_property(self, _conn, _sender, _path, _iface, name):
         if name == "AvailableSourceTypes":
             return GLib.Variant("u", AVAILABLE_SOURCE_TYPES)
         if name == "AvailableCursorModes":
@@ -1294,7 +1301,7 @@ class ScreenCastBackend:
         return None
 
     def _on_method_call(self, _conn, _sender, _path, _iface, method, params,
-                        invocation, _data):
+                        invocation):
         if method == "CreateSession":
             self._create_session(params, invocation)
         elif method == "SelectSources":
@@ -1347,7 +1354,7 @@ class ScreenCastBackend:
         self.log.info("session closed: %s", path)
 
     def _on_session_method_call(self, _conn, _sender, path, _iface, method,
-                                _params, invocation, _data):
+                                _params, invocation):
         if method != "Close":
             invocation.return_error_literal(
                 Gio.DBusError.quark(), Gio.DBusError.UNKNOWN_METHOD, method)
@@ -1366,7 +1373,7 @@ class ScreenCastBackend:
             self._on_request_method_call, None, None)
 
     def _on_request_method_call(self, _conn, _sender, path, _iface, method,
-                                _params, invocation, _data):
+                                _params, invocation):
         if method != "Close":
             invocation.return_error_literal(
                 Gio.DBusError.quark(), Gio.DBusError.UNKNOWN_METHOD, method)
@@ -1936,7 +1943,7 @@ class Client:
 
         self.bus.call(BUS, PATH, IFACE, method, params,
                       GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE,
-                      -1, None, on_done, None)
+                      -1, None, on_done)
 
     def fail(self, message):
         self.failure = message
@@ -2153,7 +2160,7 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "Start", start_params,
                           proxy.REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                          on_start_done, None)
+                          on_start_done)
 
         def on_create_done(_source, res):
             try:
@@ -2167,11 +2174,11 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "SelectSources",
                           session.select_params, proxy.REPLY_TYPE,
-                          Gio.DBusCallFlags.NONE, -1, None, on_select_done, None)
+                          Gio.DBusCallFlags.NONE, -1, None, on_select_done)
 
         self.bus.call(self.fallback.name, PORTAL_PATH, proxy.SCREEN_CAST_IFACE,
                       "CreateSession", session.create_params, proxy.REPLY_TYPE,
-                      Gio.DBusCallFlags.NONE, -1, None, on_create_done, None)
+                      Gio.DBusCallFlags.NONE, -1, None, on_create_done)
 ```
 
 - [ ] **Step 4: 単体テストが壊れていないことを確認**
