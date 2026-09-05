@@ -63,7 +63,7 @@ class Recording:
         self._closed_subscription = self._bus.signal_subscribe(
             SCREEN_CAST_NAME, SESSION_IFACE, "Closed", self._session_path, None,
             Gio.DBusSignalFlags.NONE,
-            lambda *_args: callback(), None)
+            lambda *_args: callback())
 
     def stop(self):
         """セッションを閉じる。二重呼び出しは無害。"""
@@ -75,7 +75,7 @@ class Recording:
         path, self._session_path = self._session_path, None
         self._bus.call(
             SCREEN_CAST_NAME, path, SESSION_IFACE, "Stop", None, None,
-            Gio.DBusCallFlags.NONE, -1, None, None, None)
+            Gio.DBusCallFlags.NONE, -1, None, None)
 
 
 def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5000):
@@ -133,10 +133,10 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         state["subscription"] = bus.signal_subscribe(
             SCREEN_CAST_NAME, STREAM_IFACE, "PipeWireStreamAdded",
             state["stream_path"], None, Gio.DBusSignalFlags.NONE,
-            on_stream_added, None)
+            on_stream_added)
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "Start", None, None, Gio.DBusCallFlags.NONE, -1, None,
-                 on_start_done, None)
+                 on_start_done)
 
     def on_create_done(_source, res):
         try:
@@ -149,13 +149,13 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "RecordMonitor", GLib.Variant("(sa{sv})", (connector, props)),
                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-                 on_record_done, None)
+                 on_record_done)
 
     state["timeout_id"] = GLib.timeout_add(timeout_ms, on_timeout)
     bus.call(SCREEN_CAST_NAME, SCREEN_CAST_PATH, SCREEN_CAST_IFACE,
              "CreateSession", GLib.Variant("(a{sv})", ({},)),
              GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-             on_create_done, None)
+             on_create_done)
 
 
 def _cleanup(bus, state):
@@ -167,5 +167,5 @@ def _cleanup(bus, state):
         state["subscription"] = None
     if state["session_path"] is not None:
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
-                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None, None)
+                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None)
         state["session_path"] = None
