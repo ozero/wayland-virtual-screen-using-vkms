@@ -58,12 +58,19 @@ def main(argv):
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     backend = impl.ScreenCastBackend(
-        bus, "org.freedesktop.impl.portal.desktop.%s" % opts["--fallback-backend"])
+        bus,
+        "org.freedesktop.impl.portal.desktop.%s" % opts["--fallback-backend"],
+        opts["--prefer-connector"],
+        opts["--auto-approve-when"],
+        int(opts["--retry-seconds"]),
+        int(opts["--policy-grace-ms"]))
 
     loop = GLib.MainLoop()
 
-    def on_name_acquired(*_args):
-        backend.register()
+    # 名前を取ってからオブジェクトを export すると、その間に届いた最初の要求が
+    # 「そのインターフェースは無い」で失敗しうる(実機で確認済み。gdbus introspect が
+    # 起動直後に1回だけ空を返す)。名前を取る前に export を済ませてこの窓を消す。
+    backend.register()
 
     def on_name_lost(*_args):
         log.error("D-Bus 名 %s を取得できなかった", impl.BUS_NAME)
@@ -71,7 +78,7 @@ def main(argv):
 
     Gio.bus_own_name(Gio.BusType.SESSION, impl.BUS_NAME,
                      Gio.BusNameOwnerFlags.NONE, None,
-                     on_name_acquired, on_name_lost)
+                     None, on_name_lost)
     loop.run()
     return 0
 

@@ -1,13 +1,18 @@
 """org.freedesktop.impl.portal.ScreenCast の D-Bus 面。
 
-この版はすべての要求を中継先バックエンドへそのまま渡す。バックエンドを差し込んでも
-挙動が変わらないことを先に確かめるため。承認パスは次のタスクで足す。
+ポリシーに合致した要求は Mutter を直接叩いて UI 無しでストリームを返す(承認パス)。
+合致しない要求は従来どおり xdg-desktop-portal-gnome へ中継する(中継パス)。
+判定は CreateSession のときに一度だけ行い、そのセッションの経路を固定する。
 """
 import logging
+import time
 
 from gi.repository import Gio, GLib
 
-from portal_autoapprove import protocol, proxy
+from portal_autoapprove import monitors, mutter, policy, protocol, proxy
+
+ROUTE_APPROVE = "approve"
+ROUTE_DELEGATE = "delegate"
 
 BUS_NAME = "org.freedesktop.impl.portal.desktop.autoapprove"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -75,23 +80,39 @@ REQUEST_XML = """
 
 
 class Session:
-    """1つの画面共有セッション。中継版はすべて中継先へ委ねる。"""
+    """1つの画面共有セッション。
 
-    def __init__(self, backend, path):
+    route は CreateSession のときに決めて以後変えない。SelectSources や Start で
+    決め直すと、中継経路に入るべきセッションが GNOME 側に存在しないことになる。
+    """
+
+    def __init__(self, backend, path, route, reason):
         self.backend = backend
         self.path = path
+        self.route = route
+        self.reason = reason
+        self.cursor_mode = protocol.CURSOR_MODE_HIDDEN
+        self.recording = None
         self.registration_id = None
         self.closed_subscription = None
 
     def close(self):
-        """中継先の Session を閉じる。"""
-        self.backend.fallback.close_object(self.path, SESSION_IFACE)
+        if self.recording is not None:
+            self.recording.stop()
+            self.recording = None
+        if self.route == ROUTE_DELEGATE:
+            self.backend.fallback.close_object(self.path, SESSION_IFACE)
 
 
 class ScreenCastBackend:
-    def __init__(self, bus, fallback_backend_name):
+    def __init__(self, bus, fallback_backend_name, prefer_connector, mode,
+                 retry_seconds, policy_grace_ms):
         self.bus = bus
         self.fallback = proxy.Backend(bus, fallback_backend_name)
+        self.prefer_connector = prefer_connector
+        self.mode = mode
+        self.retry_seconds = retry_seconds
+        self.policy_grace_ms = policy_grace_ms
         self.log = logging.getLogger("portal-autoapprove")
         self._screen_cast_info = Gio.DBusNodeInfo.new_for_xml(SCREEN_CAST_XML)
         self._session_info = Gio.DBusNodeInfo.new_for_xml(SESSION_XML)
@@ -132,44 +153,121 @@ class ScreenCastBackend:
 
     def _create_session(self, params, invocation):
         handle, session_handle, app_id, _options = params.unpack()
-        self.log.info('req=CreateSession session=%s app_id="%s" decision=delegate '
-                      'reason=proxy-only', session_handle, app_id)
         self._export_request(handle)
+        deadline = time.monotonic() + self.policy_grace_ms / 1000.0
 
-        def on_reply(response):
+        def settle():
+            decision = policy.decide(self.mode, policy.is_rustdesk_connected())
+            if (not decision.approve
+                    and self.mode == policy.MODE_RUSTDESK_CONNECTED
+                    and time.monotonic() < deadline):
+                # rustdesk --cm は ScreenCast 要求と同じ秒に起動する(実測)。要求の方が
+                # わずかに先だっただけの取りこぼしを防ぐため、少し待って見直す。
+                GLib.timeout_add(250, settle)
+                return GLib.SOURCE_REMOVE
+
+            route = ROUTE_APPROVE if decision.approve else ROUTE_DELEGATE
+            self.log.info('req=CreateSession session=%s app_id="%s" decision=%s reason=%s',
+                          session_handle, app_id, route, decision.reason)
+
+            if route == ROUTE_DELEGATE:
+                def on_reply(response):
+                    self._release_request(handle)
+                    # 中継先が失敗した場合、上流にセッションは存在しない。こちらだけ
+                    # export すると Close() も Closed も来ないまま残り続けるので、
+                    # 成功したときだけ export する。
+                    if response == protocol.RESPONSE_SUCCESS:
+                        self._export_session(session_handle, route, decision.reason)
+
+                self.fallback.forward("CreateSession", params, invocation, on_reply)
+                return GLib.SOURCE_REMOVE
+
+            self._export_session(session_handle, route, decision.reason)
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
             self._release_request(handle)
-            # 中継先が失敗した場合、上流にセッションは存在しない。こちらだけ
-            # export すると Close() も Closed も来ないまま残り続けるので、
-            # 成功したときだけ export する。
-            if response == protocol.RESPONSE_SUCCESS:
-                self._export_session(session_handle)
+            return GLib.SOURCE_REMOVE
 
-        self.fallback.forward("CreateSession", params, invocation, on_reply)
+        settle()
 
     def _select_sources(self, params, invocation):
-        handle = params.unpack()[0]
+        handle, session_handle, _app_id, options = params.unpack()
         self._export_request(handle)
-        self.fallback.forward("SelectSources", params, invocation,
-                              lambda _response: self._release_request(handle))
+        session = self._sessions.get(session_handle)
+
+        if session is None or session.route == ROUTE_DELEGATE:
+            self.fallback.forward("SelectSources", params, invocation,
+                                  lambda _response: self._release_request(handle))
+            return
+
+        # 要求された cursor_mode をそのまま覚える。勝手に変えない。
+        session.cursor_mode = options.get("cursor_mode", protocol.CURSOR_MODE_HIDDEN)
+        self.log.info("req=SelectSources session=%s cursor_mode=%d",
+                      session_handle, session.cursor_mode)
+        invocation.return_value(
+            GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
+        self._release_request(handle)
 
     def _start(self, params, invocation):
-        handle = params.unpack()[0]
+        handle, session_handle, app_id, _parent, _options = params.unpack()
         self._export_request(handle)
-        self.fallback.forward("Start", params, invocation,
-                              lambda _response: self._release_request(handle))
+        session = self._sessions.get(session_handle)
+
+        if session is None or session.route == ROUTE_DELEGATE:
+            self.fallback.forward("Start", params, invocation,
+                                  lambda _response: self._release_request(handle))
+            return
+
+        started = time.monotonic()
+        state = mutter.get_current_state(self.bus)
+        connector = monitors.select_connector(state, self.prefer_connector)
+        position, size = monitors.stream_geometry(state, connector)
+
+        def on_ready(recording):
+            session.recording = recording
+            recording.connect_closed(lambda: self._session_closed(session_handle))
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            self.log.info('req=Start session=%s app_id="%s" decision=approve reason=%s '
+                          "connector=%s cursor_mode=%d node_id=%d elapsed=%dms",
+                          session_handle, app_id, session.reason, connector,
+                          session.cursor_mode, recording.node_id, elapsed_ms)
+            stream_props = {
+                "position": GLib.Variant("(ii)", position),
+                "size": GLib.Variant("(ii)", size),
+                "source_type": GLib.Variant("u", protocol.SOURCE_TYPE_MONITOR),
+            }
+            results = {
+                "streams": GLib.Variant("a(ua{sv})",
+                                        [(recording.node_id, stream_props)]),
+            }
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, results)))
+            self._release_request(handle)
+
+        def on_error(exc):
+            self.log.error('req=Start session=%s app_id="%s" decision=approve '
+                           "connector=%s error=%s", session_handle, app_id,
+                           connector, exc)
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_OTHER, {})))
+            self._release_request(handle)
+
+        mutter.record_monitor(self.bus, connector, session.cursor_mode,
+                              on_ready, on_error)
 
     # ---- Session / Request オブジェクト ----
 
-    def _export_session(self, path):
+    def _export_session(self, path, route, reason):
         if path in self._sessions:
             return
-        session = Session(self, path)
+        session = Session(self, path, route, reason)
         session.registration_id = self.bus.register_object(
             path, self._session_info.interfaces[0],
             self._on_session_method_call, None, None)
-        # 中継先の Session が閉じたら、こちらの Closed も出して frontend に伝える。
-        session.closed_subscription = self.fallback.subscribe_closed(
-            path, lambda: self._session_closed(path))
+        if route == ROUTE_DELEGATE:
+            # 中継先の Session が閉じたら、こちらの Closed も出して frontend に伝える。
+            session.closed_subscription = self.fallback.subscribe_closed(
+                path, lambda: self._session_closed(path))
         self._sessions[path] = session
 
     def _session_closed(self, path):

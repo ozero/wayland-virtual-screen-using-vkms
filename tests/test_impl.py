@@ -7,7 +7,7 @@ import unittest
 
 from gi.repository import GLib
 
-from portal_autoapprove import impl
+from portal_autoapprove import impl, policy
 
 REQUEST = "/org/freedesktop/portal/desktop/request/1_1/t"
 SESSION = "/org/freedesktop/portal/desktop/session/1_1/s"
@@ -102,9 +102,15 @@ def denied_reply():
 
 class ImplTestCase(unittest.TestCase):
     def setUp(self):
+        # mode=MODE_NEVER: このファイルは中継(delegate)経路の Session/Request
+        # ライフサイクルだけを見る。承認(approve)経路は mutter/monitors への実 D-Bus
+        # 呼び出しを要するのでここでは対象にせず、ポリシー判定そのものは
+        # test_policy.py で検証済み。retry_seconds/policy_grace_ms は
+        # MODE_NEVER では参照されないので 0 でよい。
         self.bus = FakeBus()
         self.backend = impl.ScreenCastBackend(
-            self.bus, "org.freedesktop.impl.portal.desktop.gnome")
+            self.bus, "org.freedesktop.impl.portal.desktop.gnome",
+            "Virtual-1", policy.MODE_NEVER, 0, 0)
         self.backend.register()
 
     def call_method(self, method, params):
