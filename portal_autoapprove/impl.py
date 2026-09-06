@@ -82,8 +82,10 @@ REQUEST_XML = """
 class Session:
     """1つの画面共有セッション。
 
-    route は CreateSession のときに決めて以後変えない。SelectSources や Start で
-    決め直すと、中継経路に入るべきセッションが GNOME 側に存在しないことになる。
+    route は CreateSession のときに決める。SelectSources や Start で決め直すと、
+    中継経路に入るべきセッションが GNOME 側に存在しないことになるため。
+    例外は承認に失敗したときの中継フォールバックで、そこでは元の引数を
+    GNOME へ流し直したうえで route を切り替える(_delegate_from_scratch)。
     """
 
     def __init__(self, backend, path, route, reason):
@@ -302,8 +304,6 @@ class ScreenCastBackend:
         1回だけ解放する。
         """
         session.route = ROUTE_DELEGATE
-        session.closed_subscription = self.fallback.subscribe_closed(
-            session.path, lambda: self._session_closed(session.path))
 
         if session.create_params is None or session.select_params is None:
             self.log.error("session=%s 元の引数が無く中継に切り替えられない",
@@ -351,6 +351,10 @@ class ScreenCastBackend:
             if response != protocol.RESPONSE_SUCCESS:
                 fail("CreateSession", response)
                 return
+            # 中継先にセッションができてから購読する。失敗したまま購読すると、
+            # Close も Closed も来ないまま登録が残る(Task 6 で同じ誤りを直した)。
+            session.closed_subscription = self.fallback.subscribe_closed(
+                session.path, lambda: self._session_closed(session.path))
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "SelectSources",
                           session.select_params, proxy.REPLY_TYPE,

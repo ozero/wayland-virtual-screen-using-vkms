@@ -491,6 +491,82 @@ class TestDelegateFallback(RetryDelegateTestCase):
         released.assert_called_once_with(REQUEST)
         self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_CANCELLED)
 
+    def test_create_session_failure_releases_once_and_does_not_subscribe(self):
+        """CreateSession の replay が非成功応答を返した場合。
+
+        中継先にセッションは存在しない。ここで Closed を購読すると、誰も
+        Close()/Closed を発行しないまま登録が残り続ける。
+        """
+        invocation = self.start_session()
+        self.clock = 11.0
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+            self.assertEqual(self.bus.subscriptions, {})   # 応答前はまだ無い
+            self.bus.calls[-1]["callback"](None, denied_reply())   # CreateSession fails
+
+        self.assertEqual([c["method"] for c in self.bus.calls], ["CreateSession"])
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_CANCELLED)
+        released.assert_called_once_with(REQUEST)
+        self.assertEqual(self.bus.subscriptions, {})
+
+    def test_create_session_transport_error_releases_once_and_does_not_subscribe(self):
+        invocation = self.start_session()
+        self.clock = 11.0
+
+        def raising_call_finish(_res):
+            raise GLib.Error("boom")
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+            self.bus.call_finish = raising_call_finish
+            self.bus.calls[-1]["callback"](None, None)   # CreateSession の転送が失敗
+
+        self.assertIsNotNone(invocation.error)
+        self.assertIsNone(invocation.value)
+        released.assert_called_once_with(REQUEST)
+        self.assertEqual(self.bus.subscriptions, {})
+
+    def test_start_transport_error_releases_once(self):
+        invocation = self.start_session()
+        self.clock = 11.0
+
+        def raising_call_finish(_res):
+            raise GLib.Error("boom")
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+            self.bus.calls[-1]["callback"](None, ok_reply())   # CreateSession succeeds
+            self.assertEqual(len(self.bus.subscriptions), 1)  # ここでは購読済みでよい
+            self.bus.calls[-1]["callback"](None, ok_reply())   # SelectSources succeeds
+            self.bus.call_finish = raising_call_finish
+            self.bus.calls[-1]["callback"](None, None)         # Start の転送が失敗
+
+        self.assertIsNotNone(invocation.error)
+        self.assertIsNone(invocation.value)
+        released.assert_called_once_with(REQUEST)
+
+    def test_missing_original_params_returns_response_other_without_subscribing(self):
+        """create_params/select_params が保存されていない防御的分岐。
+
+        GNOME へは一切発行せず、購読も張らずに RESPONSE_OTHER で終わるはず。
+        """
+        invocation = self.start_session()
+        self.clock = 11.0
+        self.backend._sessions[SESSION].select_params = None
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
+        released.assert_called_once_with(REQUEST)
+        self.assertEqual(self.bus.subscriptions, {})
+        self.assertEqual(self.bus.calls, [])   # CreateSession にすら進んでいない
+
 
 class TestGracePolling(ImplTestCase):
     def test_delegates_when_the_grace_period_expires(self):
