@@ -351,6 +351,7 @@ systemd user unit の `ExecStart` に渡す。設定ファイルは持たない�
 | `--auto-approve-when MODE` | `rustdesk-connected` | 自動承認する条件。`rustdesk-connected` = `rustdesk --cm` 稼働中のみ / `always` = 常に / `never` = 常に中継（検証用） |
 | `--retry-seconds N` | `10` | Mutter が `Session creation inhibited` を返したときのリトライ上限。超えたら中継 |
 | `--fallback-backend NAME` | `gnome` | 中継先の D-Bus 名の末尾。`org.freedesktop.impl.portal.desktop.<NAME>` を呼ぶ |
+| `--policy-grace-ms N` | `1500` | `rustdesk-connected` モードで判定が「中継」に倒れたとき、`--cm` の出現を待つ猶予。250ms 間隔で再判定する |
 
 ### 5.7 エラー処理
 

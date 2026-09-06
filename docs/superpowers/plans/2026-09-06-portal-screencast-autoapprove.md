@@ -15,7 +15,7 @@
 - **依存を増やさない。** 使ってよいのは Python 3 標準ライブラリと PyGObject（`gi.repository.Gio`, `GLib`）のみ。`dbus-next` / `pydbus` は未インストールで、入れない。
 - **既存スクリプトの流儀に合わせる。** 実行可能な単一 CLI、docstring に日本語で用途と背景、`argparse` ではなく `sys.argv` の素朴な処理でよい（`mirror-apply.py` に倣う）。設定ファイルは持たず、すべて CLI 引数。
 - **root は `.portal` の設置1回だけ。** それ以外はすべてユーザ権限で完結すること。
-- **既定値**（spec 5.6 より、逐語）: `--prefer-connector Virtual-1` / `--auto-approve-when rustdesk-connected` / `--retry-seconds 10` / `--fallback-backend gnome`
+- **既定値**（spec 5.6 より、逐語）: `--prefer-connector Virtual-1` / `--auto-approve-when rustdesk-connected` / `--retry-seconds 10` / `--fallback-backend gnome` / `--policy-grace-ms 1500`
 - **D-Bus 名**: `org.freedesktop.impl.portal.desktop.autoapprove`、オブジェクトパス `/org/freedesktop/portal/desktop`
 - **公開プロパティ**（spec 5.3 より、逐語）: `AvailableSourceTypes = 1`（MONITOR のみ）、`AvailableCursorModes = 7`、`version = 5`
 - **差し替えるのは `org.freedesktop.impl.portal.ScreenCast` のみ。** RemoteDesktop / FileChooser / Secret 等は GNOME のまま。
@@ -1313,8 +1313,20 @@ python3 -c "from portal_autoapprove import policy; print(policy.is_rustdesk_conn
 ```
 
 Expected: 未接続で `False`、接続中に `True`。
-**接続中でも `False` なら、`pgrep -a -f rustdesk` で実際の cmdline を確認し、
-`--cm` 以外の指標に差し替えること**（設計書 9-1 の未確定事項）。
+
+**実測済みの背景（2026-09-06）:** RustDesk の `--cm` は ScreenCast 要求と**同じ秒**に起動する。
+
+```
+14:04:31  Activating ... org.freedesktop.impl.portal.desktop.gnome   ← ScreenCast 要求
+14:04:31  rustdesk[3420107]: flutter: --cm started
+```
+
+秒未満の順序は不明なので、`CreateSession` の時点で `--cm` がまだ現れていない取りこぼしが
+起こりうる。これは Task 6 の猶予ポーリング（`--policy-grace-ms`）で塞ぐ。
+
+代替案として「`rustdesk` プロセスが ESTABLISHED な TCP 接続を持つか」も実測したが、
+**`rustdesk --server` は未接続でも中継サーバへの接続を張りっぱなし**（`ESTABLISHED=2`）で
+`always` と区別がつかないため不採用。
 
 - [ ] **Step 6: コミット**
 
@@ -1632,6 +1644,7 @@ xdg-desktop-portal-gnome へそのまま中継する。中継するので「承�
   --auto-approve-when MODE   rustdesk-connected | always | never (既定 rustdesk-connected)
   --retry-seconds N          Mutter の inhibit に対するリトライ上限 (既定 10)
   --fallback-backend NAME    中継先 (既定 gnome)
+  --policy-grace-ms N        rustdesk --cm の出現を待つ猶予 (既定 1500)
 
 停止して元の挙動に戻すには ~/.config/xdg-desktop-portal/gnome-portals.conf を消して
 systemctl --user restart xdg-desktop-portal すればよい。
@@ -1648,6 +1661,7 @@ DEFAULTS = {
     "--auto-approve-when": policy.MODE_RUSTDESK_CONNECTED,
     "--retry-seconds": "10",
     "--fallback-backend": "gnome",
+    "--policy-grace-ms": "1500",
 }
 
 
@@ -1861,7 +1875,7 @@ git commit -m "portal-autoapprove: 全要求を xdp-gnome へ中継するバッ�
 **Interfaces:**
 - Consumes: `policy.decide`, `policy.is_rustdesk_connected`（Task 4）、`mutter.record_monitor`, `mutter.get_current_state`, `mutter.InhibitedError`（Task 2）、`monitors.select_connector`, `monitors.stream_geometry`（Task 1）、`protocol.*`（Task 2）
 - Produces:
-  - `impl.ScreenCastBackend(bus, fallback_backend_name, prefer_connector, mode, retry_seconds)`
+  - `impl.ScreenCastBackend(bus, fallback_backend_name, prefer_connector, mode, retry_seconds, policy_grace_ms)`
   - `impl.Session` に属性 `route`（`"approve"` または `"delegate"`）, `cursor_mode`, `recording` が増える
 
 **設計上の要点:** **判定は `CreateSession` で一度だけ行い、そのセッションの経路を固定する。**
@@ -1917,12 +1931,13 @@ class Session:
 ```python
 class ScreenCastBackend:
     def __init__(self, bus, fallback_backend_name, prefer_connector, mode,
-                 retry_seconds):
+                 retry_seconds, policy_grace_ms):
         self.bus = bus
         self.fallback = proxy.Backend(bus, fallback_backend_name)
         self.prefer_connector = prefer_connector
         self.mode = mode
         self.retry_seconds = retry_seconds
+        self.policy_grace_ms = policy_grace_ms
         self.log = logging.getLogger("portal-autoapprove")
         self._screen_cast_info = Gio.DBusNodeInfo.new_for_xml(SCREEN_CAST_XML)
         self._session_info = Gio.DBusNodeInfo.new_for_xml(SESSION_XML)
@@ -1936,19 +1951,32 @@ class ScreenCastBackend:
 ```python
     def _create_session(self, params, invocation):
         handle, session_handle, app_id, _options = params.unpack()
-        decision = policy.decide(self.mode, policy.is_rustdesk_connected())
-        route = ROUTE_APPROVE if decision.approve else ROUTE_DELEGATE
-        self.log.info('req=CreateSession session=%s app_id="%s" decision=%s reason=%s',
-                      session_handle, app_id, route, decision.reason)
+        deadline = time.monotonic() + self.policy_grace_ms / 1000.0
 
-        self._export_request(handle)
-        self._export_session(session_handle, route, decision.reason)
+        def settle():
+            decision = policy.decide(self.mode, policy.is_rustdesk_connected())
+            if (not decision.approve
+                    and self.mode == policy.MODE_RUSTDESK_CONNECTED
+                    and time.monotonic() < deadline):
+                # rustdesk --cm は ScreenCast 要求と同じ秒に起動する(実測)。要求の方が
+                # わずかに先だっただけの取りこぼしを防ぐため、少し待って見直す。
+                GLib.timeout_add(250, settle)
+                return GLib.SOURCE_REMOVE
 
-        if route == ROUTE_DELEGATE:
-            self.fallback.forward("CreateSession", params, invocation)
-            return
-        invocation.return_value(
-            GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
+            route = ROUTE_APPROVE if decision.approve else ROUTE_DELEGATE
+            self.log.info('req=CreateSession session=%s app_id="%s" decision=%s reason=%s',
+                          session_handle, app_id, route, decision.reason)
+            self._export_request(handle)
+            self._export_session(session_handle, route, decision.reason)
+
+            if route == ROUTE_DELEGATE:
+                self.fallback.forward("CreateSession", params, invocation)
+                return GLib.SOURCE_REMOVE
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
+            return GLib.SOURCE_REMOVE
+
+        settle()
 ```
 
 `_export_session` のシグネチャを合わせる:
@@ -2052,7 +2080,8 @@ class ScreenCastBackend:
         "org.freedesktop.impl.portal.desktop.%s" % opts["--fallback-backend"],
         opts["--prefer-connector"],
         opts["--auto-approve-when"],
-        int(opts["--retry-seconds"]))
+        int(opts["--retry-seconds"]),
+        int(opts["--policy-grace-ms"]))
 ```
 
 - [ ] **Step 7: 単体テストが壊れていないことを確認**
@@ -2305,11 +2334,11 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
         self.select_params = None
 ```
 
-`_create_session` の承認分岐で保存する（`invocation.return_value(...)` の直前）:
+`_create_session` の `settle()` 内、承認分岐で保存する（`invocation.return_value(...)` の直前）:
 
 ```python
-        session = self._sessions[session_handle]
-        session.create_params = params
+            session = self._sessions[session_handle]
+            session.create_params = params
 ```
 
 `_select_sources` の承認分岐で保存する（`invocation.return_value(...)` の直前）:
