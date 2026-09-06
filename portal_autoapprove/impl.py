@@ -7,7 +7,7 @@ import logging
 
 from gi.repository import Gio, GLib
 
-from portal_autoapprove import proxy
+from portal_autoapprove import protocol, proxy
 
 BUS_NAME = "org.freedesktop.impl.portal.desktop.autoapprove"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -135,22 +135,34 @@ class ScreenCastBackend:
         self.log.info('req=CreateSession session=%s app_id="%s" decision=delegate '
                       'reason=proxy-only', session_handle, app_id)
         self._export_request(handle)
-        self._export_session(session_handle)
-        self.fallback.forward("CreateSession", params, invocation)
+
+        def on_reply(response):
+            self._release_request(handle)
+            # 中継先が失敗した場合、上流にセッションは存在しない。こちらだけ
+            # export すると Close() も Closed も来ないまま残り続けるので、
+            # 成功したときだけ export する。
+            if response == protocol.RESPONSE_SUCCESS:
+                self._export_session(session_handle)
+
+        self.fallback.forward("CreateSession", params, invocation, on_reply)
 
     def _select_sources(self, params, invocation):
         handle = params.unpack()[0]
         self._export_request(handle)
-        self.fallback.forward("SelectSources", params, invocation)
+        self.fallback.forward("SelectSources", params, invocation,
+                              lambda _response: self._release_request(handle))
 
     def _start(self, params, invocation):
         handle = params.unpack()[0]
         self._export_request(handle)
-        self.fallback.forward("Start", params, invocation)
+        self.fallback.forward("Start", params, invocation,
+                              lambda _response: self._release_request(handle))
 
     # ---- Session / Request オブジェクト ----
 
     def _export_session(self, path):
+        if path in self._sessions:
+            return
         session = Session(self, path)
         session.registration_id = self.bus.register_object(
             path, self._session_info.interfaces[0],
@@ -190,6 +202,17 @@ class ScreenCastBackend:
             path, self._request_info.interfaces[0],
             self._on_request_method_call, None, None)
 
+    def _release_request(self, path):
+        """応答を返し終えた Request を後片付けする。
+
+        impl.portal.Request の Close() は「処理中の要求を取り消す」ときにしか
+        呼ばれない。正常に応答を返した場合は誰も Close() しないので、ここで
+        自分で外さないと常駐デーモンに D-Bus オブジェクトが溜まり続ける。
+        """
+        registration_id = self._requests.pop(path, None)
+        if registration_id is not None:
+            self.bus.unregister_object(registration_id)
+
     def _on_request_method_call(self, _conn, _sender, path, _iface, method,
                                 _params, invocation):
         if method != "Close":
@@ -198,6 +221,4 @@ class ScreenCastBackend:
             return
         self.fallback.close_object(path, REQUEST_IFACE)
         invocation.return_value(None)
-        registration_id = self._requests.pop(path, None)
-        if registration_id is not None:
-            self.bus.unregister_object(registration_id)
+        self._release_request(path)

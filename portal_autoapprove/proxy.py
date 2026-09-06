@@ -21,18 +21,24 @@ class Backend:
         self._bus = bus
         self.name = name
 
-    def forward(self, method, params, invocation):
+    def forward(self, method, params, invocation, on_reply=None):
         """ScreenCast のメソッドをそのまま転送し、返り値で invocation に応答する。
 
         中継先がダイアログを出している間は返らないので timeout は無制限(-1)。
+        on_reply は応答を返し終えたあとに呼ばれる。引数は中継先が返した response
+        コード。転送そのものが失敗した場合は None。
         """
         def on_done(_source, res):
             try:
                 reply = self._bus.call_finish(res)
             except GLib.Error as err:
                 invocation.return_gerror(err)
+                if on_reply is not None:
+                    on_reply(None)
                 return
             invocation.return_value(reply)
+            if on_reply is not None:
+                on_reply(reply.unpack()[0])
 
         self._bus.call(self.name, PORTAL_PATH, SCREEN_CAST_IFACE, method,
                        params, REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
