@@ -31,6 +31,7 @@ DP-1       3840x2160 @ 59.997Hz
 | `/etc/modprobe.d/vkms.conf` | `options vkms create_default_dev=1 enable_cursor=1` | vkms のオプション |
 | `/etc/modules-load.d/vkms.conf` | `vkms` | 起動時に自動ロード |
 | `~/.config/monitors.xml` | DP-1 + Virtual-1 のミラー構成 | GNOME の画面配置 |
+| `gsettings` (`org.gnome.desktop.session idle-delay`) | `0` | アイドル画面ブランクによる remote access の inhibit を止める（画面共有ダイアログの自動承認の前提。後述） |
 
 ## 重要: EDID 注入は不可能（調査で確定）
 
@@ -142,6 +143,73 @@ EOF
 
 **モニタを抜き挿しした後にミラーが崩れたら、`python3 mirror-apply.py` を再実行するだけでよい。**
 その組み合わせに対する構成が保存され、以後は自動復元される。
+
+## 画面共有ダイアログの自動承認
+
+RustDesk 接続のたびに出る GNOME の「画面を共有」ダイアログを無人で通す仕組み。
+設計・調査の経緯は [README.md](README.md) の5章と
+[docs/superpowers/specs/2026-09-05-portal-screencast-autoapprove-design.md](docs/superpowers/specs/2026-09-05-portal-screencast-autoapprove-design.md)
+を参照。ここには運用者向けの手順だけを書く。
+
+### 設置状態の確認
+
+```bash
+bash portal-autoapprove-install.sh --status
+```
+
+`portals.conf` の候補ファイルのうちどれが存在するか、`ScreenCast` の振り先、
+`.portal` ファイル、systemd unit の状態がまとめて出る。
+
+### ログの見方
+
+```bash
+journalctl --user -u portal-autoapprove
+```
+
+1行の例:
+
+```
+req=Start session=/…/1_668/u1 app_id="" decision=approve reason=rustdesk-cm-running
+             connector=Virtual-1 node_id=88 elapsed=5ms
+```
+
+- `req=` — どの D-Bus メソッド呼び出しか（`CreateSession` / `SelectSources` / `Start`）
+- `decision=` — `approve`（自動承認）か `delegate`（xdg-desktop-portal-gnome へ中継 =
+  従来どおりダイアログが出る）
+- `reason=` — 判定の根拠。`rustdesk-cm-running` = `rustdesk --cm` を検出、
+  `mode-always` = `--auto-approve-when always` 設定、`rustdesk-not-connected` = `--cm` 未検出
+- `connector=` / `node_id=` / `elapsed=` — 承認した場合の実際の共有対象と所要時間
+
+### ダイアログが出るようになったときの切り分け手順
+
+1. `journalctl --user -u portal-autoapprove -n 20` で `decision=` を見る
+2. `decision=delegate reason=rustdesk-not-connected` なら `--cm` が検出できていない。
+   `pgrep -a -f rustdesk` で実際の cmdline を確認する（判定は argv[0] の basename が
+   `rustdesk` で、引数に `--cm` を含むことが条件。プロセス名や引数の一部が
+   一致するだけでは判定に入らない）
+3. ログに何も出ていないなら xdp がそもそも自作バックエンドを選んでいない。
+   `bash portal-autoapprove-install.sh --status` で `ScreenCast=autoapprove;` に
+   なっているか確認し、`systemctl --user restart xdg-desktop-portal.service`
+4. `decision=approve` なのに画面が出ない・失敗しているなら Mutter 側の問題。
+   `python3 screencast-probe.py` を実行する（`exit=2` なら inhibit されている）
+5. inhibit なら `gsettings get org.gnome.desktop.session idle-delay` を確認する
+   （`0` でなければそれが原因。`gsettings set org.gnome.desktop.session idle-delay 0`
+   で直す）
+
+### 元に戻す手順
+
+```bash
+bash portal-autoapprove-install.sh --uninstall
+```
+
+sudo が使えない場合は次のコマンドでも GNOME の既定動作（ダイアログが毎回出る状態）に
+戻る（`.portal` ファイルの撤去には root が要るが、`portals.conf` を消せば xdp は
+自作バックエンドを選ばなくなる）:
+
+```bash
+rm -f ~/.config/xdg-desktop-portal/*portals.conf && \
+  systemctl --user restart xdg-desktop-portal.service
+```
 
 ## 同梱スクリプト
 

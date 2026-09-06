@@ -3,7 +3,8 @@
 RustDesk 接続のたびに出る「画面を共有」ダイアログ（xdg-desktop-portal の ScreenCast
 承認 UI）を無人で通し、常に Virtual-1 を共有対象にするための設計。
 
-- **状態**: 設計完了・未実装（2026-09-05）
+- **状態**: 実装・実機確認済み（2026-09-06。RustDesk 実接続でダイアログ 0 回・DP-1 消灯継続を確認）。
+  設計時点の予測との差分は 2.5 / 5.7 / 9章に追記した
 - **前提となる構成**: [../../../README.md](../../../README.md)（VKMS 仮想モニタ + GNOME + RustDesk）
 
 ---
@@ -105,7 +106,10 @@ Mutter 側は `org.gnome.Mutter.ScreenCast` の `Version = 4`。
 inhibit の要因は未特定。ロック画面は除外済み（`org.gnome.desktop.screensaver lock-enabled = false`）。
 残る有力候補はアイドル時の画面ブランク（`org.gnome.desktop.session idle-delay = 900`）。
 
-### 2.5 副次原因: app_id が空で restore token が機能していない
+### 2.5 副次原因: app_id が空で restore token が機能していない【実測の結果、この予測は外れた】
+
+**この節の予測（app_id が空だから restore token が保管されない）は実機確認(2026-09-06)で外れた。
+以下は元の予測を残し、実測結果を追記する。**
 
 restore token の保管先は permission store の `screencast` テーブル。
 
@@ -131,7 +135,32 @@ xdg-desktop-portal の app_id 導出は `sd_pid_get_user_unit()` の結果に対
 
 RustDesk は **system unit** にいるため `sd_pid_get_user_unit()` が失敗し、`app-` 前提の
 正規表現にも構造的にマッチしない。よって `app_id` は常に空文字列で、restore token が
-アプリ単位で正しく保管・再利用されない。
+アプリ単位で正しく保管・再利用されない — **という予測だった。**
+
+#### 実測の結果（2026-09-06、xdg-desktop-portal-gnome 経由でダイアログを一度承認した後）
+
+**保管自体はされた。** `app_id` が空でもエントリは作られる。
+
+```
+$ flatpak permissions screencast
+screencast  4106b88b-d927-4fd3-ba0b-2cce15dbc309    yes
+  ('GNOME', 1, <(…, [(0, 1, <'HPN:HP 27f 4k:3CM02743XR'>)])>)
+```
+
+**本当の問題は保管の有無ではなく、紐づく先だった。** 記録されている
+`HPN:HP 27f 4k:3CM02743XR` は **DP-1 の EDID** である。ミラー構成では論理モニタが1つしか
+無いため、xdg-desktop-portal-gnome はその識別子として DP-1 の EDID を記録する
+（Virtual-1 の識別子は `unknown:unknown:unknown`）。DP-1 は電源 OFF で connector ごと消えるため、
+この識別子に対する復元は構造的に必ず失敗する。
+
+**つまり VKMS ミラー構成と GNOME の画面共有の復元機能は構造的に噛み合っていない。**
+「消えないモニタ(Virtual-1)を用意する」という本リポジトリ冒頭(1章)の設計が、ポータルの
+永続化層(restore token)では活きなかった。app_id の問題は的外れではなかったが、致命傷では
+なかった — たとえ app_id が付いて permission store がアプリ単位で正しく引けても、
+その中身がミラー中は DP-1 の EDID である以上、復元は失敗し続ける。
+
+Phase 1 が `persist_mode` / `restore_token` を受け取っても無視し `restore_data` を返さない
+設計（5.3）にしたのは、この構造的な不整合を踏まえた判断でもある。
 
 ### 2.6 重要な帰結: 要求元プロセスは同定できない
 
@@ -360,8 +389,39 @@ systemd user unit の `ExecStart` に渡す。設定ファイルは持たない�
 | Mutter が `Session creation inhibited` | 500ms 間隔で最大 `--retry-seconds`（既定10秒）リトライ。RustDesk は接続時に uinput で入力を注入するため、ブランク由来の inhibit ならこの間に解除される見込み。超えたら xdp-gnome へ中継 |
 | `Virtual-1` が無い | 5.4 のフォールバック → それも失敗なら中継 |
 | Mutter セッションが外部要因で終了 | Mutter の `Session.Closed` を購読し、impl の `Session.Closed` を emit して frontend に伝播 |
-| デーモンがクラッシュ | systemd user unit `Restart=on-failure`。次要求は D-Bus activation で再起動。activation 自体が失敗すれば xdp は `portals.conf` のフォールバック `gnome` を使う → **ダイアログに戻る＝安全側** |
+| デーモンがクラッシュ | systemd user unit `Restart=on-failure`。次要求は D-Bus activation で再起動。**復旧は kill switch（下記の訂正を参照）** |
 | ポリシー不合致 | xdp-gnome へ中継（従来通りダイアログ） |
+
+**【訂正・2026-09-06】上表の「デーモンがクラッシュ」の行は当初こう書かれていた:**
+
+> activation 自体が失敗すれば xdp は `portals.conf` のフォールバック `gnome` を使う
+> → ダイアログに戻る＝安全側
+
+**これは誤りだった。** xdg-desktop-portal は**起動時に各インターフェースの実装を1つ選んで
+固定する**。実行時のフォールバックは存在しない。デーモンが後で落ちても `gnome` には
+切り替わらない。
+
+しかも `portals.conf` に `org.freedesktop.impl.portal.ScreenCast=autoapprove;gnome;` と
+複数指定すると、xdp は `UseIn`（対応デスクトップ）を持つ実装を優先するため、
+**`UseIn` を持たない自作バックエンドが負けて `gnome` が選ばれる。** 実測ログ:
+
+```
+Found 'gnome' in configuration for org.freedesktop.impl.portal.ScreenCast
+Using gnome.portal for org.freedesktop.impl.portal.ScreenCast (config)
+```
+
+`autoapprove;` 単体に変更したところ通った:
+
+```
+Found 'autoapprove' in configuration for org.freedesktop.impl.portal.ScreenCast
+Using autoapprove.portal for org.freedesktop.impl.portal.ScreenCast (config)
+```
+
+つまりこの「フォールバック指定」は**安全網ではなく、設定ミスを黙って隠す仕掛け**だった。
+実際これが原因で「設置したのに何も起きない（常に gnome が選ばれ続ける）」の原因特定に
+時間を要した（`3c0283c`）。現在の実装は `autoapprove;` 単体に修正済み。
+デーモンが壊れた場合の復旧は D-Bus activation の再起動ではなく **kill switch**
+（設定ファイル削除 + `xdg-desktop-portal.service` 再起動、5.9）である。
 
 ### 5.8 設置
 
@@ -491,15 +551,62 @@ RustDesk の ID 接続・中継・ファイル転送を失う点は、この時�
 1. **`rustdesk --cm` の起動順序**。ScreenCast 要求より先に `--cm` が起動するかは未確認。
    Phase 1 の最初のタスクとして、要求時点のプロセス一覧をログに出して確かめる。
    順序が逆なら `--auto-approve-when always`（＋監査ログ）に切り替える
+
+   **解消（2026-09-06）:** ScreenCast 要求と**同じ秒**に起動することを実測で確認した。
+
+   ```
+   14:04:31  Activating … org.freedesktop.impl.portal.desktop.gnome   ← ScreenCast 要求
+   14:04:31  rustdesk[3420107]: flutter: --cm started
+   ```
+
+   秒未満の順序までは分からないため、`CreateSession` 時点で `--cm` がまだ現れていない
+   取りこぼしに備えて `--policy-grace-ms`（既定 1500、250ms 間隔で再判定）を実装した。
+   ただし実運用の接続（実機検証）では猶予ポーリングの出番はなく、初回判定の
+   `reason=rustdesk-cm-running` でそのまま承認された。
+
+   代替案として「rustdesk プロセスが ESTABLISHED な TCP 接続を持つか」も実測したが、
+   `rustdesk --server` は未接続でも中継サーバへの接続を張りっぱなし（`ESTABLISHED=2`）で
+   `always` と区別できないため不採用にした。
+
 2. **`portals.conf` の実効ファイル名**。`XDG_CURRENT_DESKTOP=ubuntu:GNOME` なので xdp は
    各設定ディレクトリで `ubuntu-portals.conf` → `gnome-portals.conf` → `portals.conf` の順に
    探す。どれが実際に読まれるかは journal で確認して確定する
+
+   **解消（2026-09-06）:** `XDG_CURRENT_DESKTOP=ubuntu:GNOME` により最初に読まれるのは
+   **`ubuntu-portals.conf`** であることを journal で確認した。
+
+   ```
+   Looking for portals configuration in '/home/ozero-rgfx/.config/xdg-desktop-portal/ubuntu-portals.conf'
+   ```
+
+   設置スクリプト（`portal-autoapprove-install.sh`）は候補名すべて
+   （`ubuntu-portals.conf` / `gnome-portals.conf` / `portals.conf`）に同じ内容を書くことで
+   環境差を吸収する。撤去時はファイル先頭のマーカー行で自分が書いたものだけを見分けて
+   撤去し、他の設定を巻き込まない。
+
 3. **inhibit の要因**（4.2）。特定できれば Phase 1 が不要になる可能性がある。
    逆に S0（通常状態）でも通らなければ inhibit は恒久的で、**Phase 1 を含む全案が成立しない**。
    その場合は gnome-shell 側の発生源特定が唯一の道になる
+
+   **解消。原因は gnome-shell のアイドル画面ブランク（スクリーンシールド）だった。**
+   `lock-enabled=false` にしていてもシールドは立ち、remote access を inhibit する。
+   詳細な実測手順と結論は `docs/superpowers/findings/2026-09-06-inhibit-investigation.md`
+   を参照。対処は `gsettings set org.gnome.desktop.session idle-delay 0`。
+
 4. **`app-*.scope` での app_id 付与**（4.3）が実際に効くか
+
+   **未実施のまま。** 2.5 の実測により、app_id は本質的な原因ではなかった
+   （app_id が空でも restore token は保管されており、本当の問題は DP-1 の EDID に紐づく
+   ことだった）と判明したため、実施の必要が無くなった。
+
 5. **xdp-gnome の SEGV**（2.4）。Phase 1 では該当経路を通らなくなるため実害は消えるが、
    中継パス（5.1）では依然通るので、再現条件を記録しておく
+
+   **解消。再現条件が判明した。** 画面共有ダイアログを出した直後、セッションを閉じる経路で
+   必ず落ちる。apport のスタックトレース（`xdg-desktop-portal-gnome 46.2-0ubuntu1`）によれば
+   `g_object_unref` → `g_type_check_instance_is_fundamentally_a` の use-after-free。
+   自作バックエンドの承認経路（Phase 1）はこのコードパスを通らないため実害が消えたが、
+   中継経路（従来のダイアログ）を通す限り依然として発生しうる。
 
 ---
 
