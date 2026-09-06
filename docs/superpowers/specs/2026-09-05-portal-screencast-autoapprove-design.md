@@ -440,22 +440,47 @@ systemd user unit（`~/.config/systemd/user/portal-autoapprove.service`、
 
 バックエンドの選択:
 
+**【5.7 の訂正を反映】** 設置スクリプトは `XDG_CURRENT_DESKTOP` を `:` で分割した各要素
+（小文字化）＋ `portals.conf` という**候補名すべて**に同じ内容を書く。この環境では
+`ubuntu-portals.conf` / `gnome-portals.conf` / `portals.conf` の3つ。どのファイルが
+実際に読まれるかは環境変数の内容に依存する（9章2項）ため、単一ファイルに書くだけでは
+取りこぼす。内容はどのファイルも同じ:
+
 ```
-~/.config/xdg-desktop-portal/gnome-portals.conf
-  [preferred]
-  default=gnome;gtk;
-  org.freedesktop.impl.portal.Secret=gnome-keyring;
-  org.freedesktop.impl.portal.ScreenCast=autoapprove;gnome;
+# managed by portal-autoapprove-install.sh
+[preferred]
+default=gnome;gtk;
+org.freedesktop.impl.portal.Secret=gnome-keyring;
+org.freedesktop.impl.portal.ScreenCast=autoapprove;
 ```
 
-`ScreenCast` の値は「自作 → 失敗時は gnome」というフォールバック順。他のポータルは
+**`;gnome` のフォールバックは付けない。** 理由は 5.7 の訂正のとおりで、`UseIn`
+（対応デスクトップ）を持つ `gnome` に対して `UseIn` を持たない自作バックエンドが負けて
+常に `gnome` が選ばれてしまう。加えて xdg-desktop-portal は起動時に実装を1つ選んで
+固定するため、実行時フォールバックとしての意味もそもそも無い。
+
+先頭の marker 行（`# managed by portal-autoapprove-install.sh`）は、撤去時に
+「このスクリプトが書いたファイルだけ」を見分けて消すための目印。ユーザー自身が
+別の目的で置いた設定ファイルを巻き添えにしない。他のポータル（FileChooser / Secret 等）は
 一切触らない。
 
 ### 5.9 kill switch
 
-`~/.config/xdg-desktop-portal/gnome-portals.conf` を削除して
-`systemctl --user restart xdg-desktop-portal` で完全に元通りになる。デーモンや
-スクリプトを消す必要はない。`portal-autoapprove-install.sh --uninstall` で全撤去。
+`portal-autoapprove-install.sh --uninstall` が、marker 付きの `portals.conf` 系
+ファイルをすべて削除し、D-Bus activation service と systemd user unit を削除し、
+`.portal` ファイルを（root 権限で）外し、`xdg-desktop-portal.service` を再起動する。
+これで完全に元通りになる。
+
+sudo が使えない場合は次のコマンドだけでも元に戻る:
+
+```bash
+rm -f ~/.config/xdg-desktop-portal/*portals.conf
+systemctl --user restart xdg-desktop-portal.service
+```
+
+`.portal` ファイルが `/usr/share/xdg-desktop-portal/portals/` に残っていても、
+それを選ぶ `portals.conf` の指定が無くなれば xdp は選ばない。つまり `portals.conf`
+さえ消せば GNOME の既定バックエンドに戻る。
 
 ---
 

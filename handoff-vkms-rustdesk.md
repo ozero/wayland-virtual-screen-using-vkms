@@ -170,7 +170,7 @@ journalctl --user -u portal-autoapprove
 
 ```
 req=Start session=/…/1_668/u1 app_id="" decision=approve reason=rustdesk-cm-running
-             connector=Virtual-1 node_id=88 elapsed=5ms
+             connector=Virtual-1 cursor_mode=1 node_id=88 elapsed=5ms
 ```
 
 - `req=` — どの D-Bus メソッド呼び出しか（`CreateSession` / `SelectSources` / `Start`）
@@ -178,7 +178,8 @@ req=Start session=/…/1_668/u1 app_id="" decision=approve reason=rustdesk-cm-ru
   従来どおりダイアログが出る）
 - `reason=` — 判定の根拠。`rustdesk-cm-running` = `rustdesk --cm` を検出、
   `mode-always` = `--auto-approve-when always` 設定、`rustdesk-not-connected` = `--cm` 未検出
-- `connector=` / `node_id=` / `elapsed=` — 承認した場合の実際の共有対象と所要時間
+- `connector=` / `cursor_mode=` / `node_id=` / `elapsed=` — 承認した場合の実際の共有対象・
+  カーソルモード・所要時間
 
 ### ダイアログが出るようになったときの切り分け手順
 

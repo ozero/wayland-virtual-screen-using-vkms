@@ -356,7 +356,8 @@ xdg-desktop-portal-gnome の SEGV: 0
 DP-1: disconnected
 ```
 
-E2E ツール（`screencast-client-test.py --mode always`、DP-1 消灯中）でも確認済み:
+E2E ツール（デーモンを `--auto-approve-when always` で起動した状態で
+`screencast-client-test.py` を実行、DP-1 消灯中）でも確認済み:
 
 ```
 成功: node_id=88 position=(0, 0) size=(3840, 2160) source_type=1   exit=0
