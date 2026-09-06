@@ -15,11 +15,18 @@
 - **依存を増やさない。** 使ってよいのは Python 3 標準ライブラリと PyGObject（`gi.repository.Gio`, `GLib`）のみ。`dbus-next` / `pydbus` は未インストールで、入れない。
 - **既存スクリプトの流儀に合わせる。** 実行可能な単一 CLI、docstring に日本語で用途と背景、`argparse` ではなく `sys.argv` の素朴な処理でよい（`mirror-apply.py` に倣う）。設定ファイルは持たず、すべて CLI 引数。
 - **root は `.portal` の設置1回だけ。** それ以外はすべてユーザ権限で完結すること。
-- **既定値**（spec 5.6 より、逐語）: `--prefer-connector Virtual-1` / `--auto-approve-when rustdesk-connected` / `--retry-seconds 10` / `--fallback-backend gnome`
+- **既定値**（spec 5.6 より、逐語）: `--prefer-connector Virtual-1` / `--auto-approve-when rustdesk-connected` / `--retry-seconds 10` / `--fallback-backend gnome` / `--policy-grace-ms 1500`
 - **D-Bus 名**: `org.freedesktop.impl.portal.desktop.autoapprove`、オブジェクトパス `/org/freedesktop/portal/desktop`
 - **公開プロパティ**（spec 5.3 より、逐語）: `AvailableSourceTypes = 1`（MONITOR のみ）、`AvailableCursorModes = 7`、`version = 5`
 - **差し替えるのは `org.freedesktop.impl.portal.ScreenCast` のみ。** RemoteDesktop / FileChooser / Secret 等は GNOME のまま。
 - **kill switch を壊さない。** `~/.config/xdg-desktop-portal/gnome-portals.conf` を削除して `systemctl --user restart xdg-desktop-portal` すれば必ず元の挙動に戻ること。
+- **PyGObject のコールバック規約**（3.48.2 で実測確認済み。守らないと `TypeError` になる）:
+  - `bus.call(..., cancellable, callback)` — 末尾に `user_data` を渡さないこと。コールバックは `(source, result)` の**2引数**
+  - `bus.signal_subscribe(..., callback)` — 同上。コールバックは `(connection, sender, path, interface, signal, params)` の**6引数**
+  - `bus.register_object(path, iface_info, method_call, get_property, set_property)` — `method_call` は
+    `(connection, sender, path, interface, method, params, invocation)` の**7引数**、`get_property` は
+    `(connection, sender, path, interface, property_name)` の**5引数**。どちらにも `user_data` も `error` も渡らない
+  - `register_object` の第5引数に `None` を渡すのは正しい（set_property であって user_data ではない）
 - **テスト実行**: リポジトリルートで `python3 -m unittest discover -s tests -t . -v`
 - 対象環境: Ubuntu 24.04 / GNOME 46 (mutter 46.2) / Wayland / xdg-desktop-portal 1.18.4 / xdg-desktop-portal-gnome 46.2 / `XDG_CURRENT_DESKTOP=ubuntu:GNOME`
 
@@ -506,7 +513,7 @@ class Recording:
         self._closed_subscription = self._bus.signal_subscribe(
             SCREEN_CAST_NAME, SESSION_IFACE, "Closed", self._session_path, None,
             Gio.DBusSignalFlags.NONE,
-            lambda *_args: callback(), None)
+            lambda *_args: callback())
 
     def stop(self):
         """セッションを閉じる。二重呼び出しは無害。"""
@@ -518,7 +525,7 @@ class Recording:
         path, self._session_path = self._session_path, None
         self._bus.call(
             SCREEN_CAST_NAME, path, SESSION_IFACE, "Stop", None, None,
-            Gio.DBusCallFlags.NONE, -1, None, None, None)
+            Gio.DBusCallFlags.NONE, -1, None, None)
 
 
 def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5000):
@@ -528,15 +535,33 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
     失敗時は on_error(Exception) を呼ぶ。inhibit なら InhibitedError が渡る。
     GLib のメインループが回っていることが前提。
     """
-    state = {"done": False, "session_path": None, "stream_path": None,
-             "subscription": None, "timeout_id": None}
+    state = {"done": False, "aborted": False, "session_path": None,
+             "stream_path": None, "subscription": None, "timeout_id": None}
 
     def finish_error(exc):
         if state["done"]:
             return
         state["done"] = True
+        state["aborted"] = True
         _cleanup(bus, state)
         on_error(exc)
+
+    def abandon(session_path=None):
+        """打ち切ったあとに遅れて届いた応答の後始末。
+
+        タイムアウトやエラーで打ち切ったあとに Mutter の応答が届くと、こちらが
+        知らないままセッションが走り続ける(=「画面共有中」の表示が消えない)。
+        常駐デーモンではプロセス終了による後始末も効かないので、遅れて判明した
+        セッションはここで明示的に止める。
+        """
+        path = session_path or state["session_path"]
+        if state["subscription"] is not None:
+            bus.signal_unsubscribe(state["subscription"])
+            state["subscription"] = None
+        if path is not None:
+            bus.call(SCREEN_CAST_NAME, path, SESSION_IFACE, "Stop", None, None,
+                     Gio.DBusCallFlags.NONE, -1, None, None)
+        state["session_path"] = None
 
     def finish_ok(node_id):
         if state["done"]:
@@ -564,6 +589,9 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
             bus.call_finish(res)
         except GLib.Error as err:
             finish_error(_wrap_error(err))
+            return
+        if state["aborted"]:
+            abandon()
 
     def on_record_done(_source, res):
         try:
@@ -571,15 +599,18 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         except GLib.Error as err:
             finish_error(_wrap_error(err))
             return
+        if state["aborted"]:
+            abandon()
+            return
         state["stream_path"] = reply.unpack()[0]
         # Start より先に購読する。順序を逆にすると取りこぼす。
         state["subscription"] = bus.signal_subscribe(
             SCREEN_CAST_NAME, STREAM_IFACE, "PipeWireStreamAdded",
             state["stream_path"], None, Gio.DBusSignalFlags.NONE,
-            on_stream_added, None)
+            on_stream_added)
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "Start", None, None, Gio.DBusCallFlags.NONE, -1, None,
-                 on_start_done, None)
+                 on_start_done)
 
     def on_create_done(_source, res):
         try:
@@ -587,18 +618,23 @@ def record_monitor(bus, connector, cursor_mode, on_ready, on_error, timeout_ms=5
         except GLib.Error as err:
             finish_error(_wrap_error(err))
             return
-        state["session_path"] = reply.unpack()[0]
+        session_path = reply.unpack()[0]
+        if state["aborted"]:
+            # 打ち切った後に作られたセッション。放置すると誰も止められない。
+            abandon(session_path)
+            return
+        state["session_path"] = session_path
         props = {"cursor-mode": GLib.Variant("u", protocol.to_mutter_cursor_mode(cursor_mode))}
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
                  "RecordMonitor", GLib.Variant("(sa{sv})", (connector, props)),
                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-                 on_record_done, None)
+                 on_record_done)
 
     state["timeout_id"] = GLib.timeout_add(timeout_ms, on_timeout)
     bus.call(SCREEN_CAST_NAME, SCREEN_CAST_PATH, SCREEN_CAST_IFACE,
              "CreateSession", GLib.Variant("(a{sv})", ({},)),
              GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None,
-             on_create_done, None)
+             on_create_done)
 
 
 def _cleanup(bus, state):
@@ -610,9 +646,211 @@ def _cleanup(bus, state):
         state["subscription"] = None
     if state["session_path"] is not None:
         bus.call(SCREEN_CAST_NAME, state["session_path"], SESSION_IFACE,
-                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None, None)
+                 "Stop", None, None, Gio.DBusCallFlags.NONE, -1, None, None)
         state["session_path"] = None
 ```
+
+- [ ] **Step 5b: mutter.py の状態機械テストを書く**
+
+`record_monitor` は「タイムアウト」「3つの D-Bus 応答」「PipeWire のシグナル」が任意の順序で
+届く状態機械で、順序の取り違えは**止められない録画セッションの取り残し**（=「画面共有中」の
+表示が消えない）に直結する。にせの `bus` と差し替えた `GLib.timeout_add` で、D-Bus を立てずに
+決定的に再現できるので、レースの経路に絞って固定する。
+
+`tests/test_mutter.py`:
+
+```python
+"""record_monitor の状態遷移を D-Bus 無しで検証する。
+
+にせの bus に応答を保留させ、テストが任意の順序でコールバックを発火させることで
+「打ち切った後に応答が届く」レースを決定的に再現する。
+"""
+import unittest
+from unittest import mock
+
+from gi.repository import GLib
+
+from portal_autoapprove import mutter, protocol
+
+
+class FakeBus:
+    """call() の応答を即座に返さず保留する最小のにせ bus。"""
+
+    def __init__(self):
+        self.calls = []
+        self.subscriptions = {}
+        self.unsubscribed = []
+        self._next_sub = 1
+
+    def call(self, _name, path, _iface, method, _params, _reply_type, _flags,
+             _timeout, _cancellable, callback=None):
+        self.calls.append({"method": method, "path": path, "callback": callback})
+
+    def call_finish(self, res):
+        # テストは reply の Variant をそのまま res として渡す
+        return res
+
+    def signal_subscribe(self, _sender, _iface, member, path, _arg0, _flags,
+                         callback):
+        sub = self._next_sub
+        self._next_sub += 1
+        self.subscriptions[sub] = {"member": member, "path": path,
+                                   "callback": callback}
+        return sub
+
+    def signal_unsubscribe(self, sub):
+        self.unsubscribed.append(sub)
+        self.subscriptions.pop(sub, None)
+
+    def methods(self):
+        return [c["method"] for c in self.calls]
+
+    def find(self, method):
+        return [c for c in self.calls if c["method"] == method]
+
+
+class FakeTimers:
+    """GLib.timeout_add / source_remove の差し替え。"""
+
+    def __init__(self):
+        self.callbacks = []
+        self.removed = []
+
+    def add(self, _interval, callback):
+        self.callbacks.append(callback)
+        return len(self.callbacks)
+
+    def remove(self, source_id):
+        self.removed.append(source_id)
+
+    def fire(self):
+        self.callbacks[-1]()
+
+
+class RecordMonitorTestCase(unittest.TestCase):
+    def setUp(self):
+        self.bus = FakeBus()
+        self.timers = FakeTimers()
+        self.ready = []
+        self.errors = []
+        patcher_add = mock.patch.object(mutter.GLib, "timeout_add", self.timers.add)
+        patcher_rm = mock.patch.object(mutter.GLib, "source_remove", self.timers.remove)
+        patcher_add.start()
+        patcher_rm.start()
+        self.addCleanup(patcher_add.stop)
+        self.addCleanup(patcher_rm.stop)
+
+    def start(self):
+        mutter.record_monitor(self.bus, "Virtual-1",
+                              protocol.CURSOR_MODE_EMBEDDED,
+                              self.ready.append, self.errors.append,
+                              timeout_ms=1)
+
+    def reply_object(self, path):
+        return GLib.Variant("(o)", (path,))
+
+
+class TestHappyPath(RecordMonitorTestCase):
+    def test_full_sequence_yields_recording_with_node_id(self):
+        self.start()
+        self.assertEqual(self.bus.methods(), ["CreateSession"])
+
+        self.bus.find("CreateSession")[0]["callback"](
+            None, self.reply_object("/session/u1"))
+        self.assertEqual(self.bus.methods(), ["CreateSession", "RecordMonitor"])
+
+        self.bus.find("RecordMonitor")[0]["callback"](
+            None, self.reply_object("/stream/u1"))
+        self.assertEqual(self.bus.methods(),
+                         ["CreateSession", "RecordMonitor", "Start"])
+
+        # Start より先に購読していること(取りこぼし防止)
+        self.assertEqual(len(self.bus.subscriptions), 1)
+        sub = next(iter(self.bus.subscriptions.values()))
+        self.assertEqual(sub["member"], "PipeWireStreamAdded")
+
+        self.bus.find("Start")[0]["callback"](None, None)
+        sub["callback"](None, None, "/stream/u1", None, "PipeWireStreamAdded",
+                        GLib.Variant("(u)", (75,)))
+
+        self.assertEqual(len(self.ready), 1)
+        self.assertEqual(self.ready[0].node_id, 75)
+        self.assertEqual(self.errors, [])
+        self.assertNotIn("Stop", self.bus.methods())
+
+    def test_stream_signal_before_start_reply_keeps_the_recording_alive(self):
+        """PipeWireStreamAdded が Start の応答より先に届く順序。
+
+        購読を Start より先に行っている以上この順序は起こりうる。成功したあとに
+        Start の応答が届いても、渡したばかりのセッションを止めてはいけない。
+        """
+        self.start()
+        self.bus.find("CreateSession")[0]["callback"](
+            None, self.reply_object("/session/u1"))
+        self.bus.find("RecordMonitor")[0]["callback"](
+            None, self.reply_object("/stream/u1"))
+        sub = next(iter(self.bus.subscriptions.values()))
+
+        # Start の応答より先にシグナルが届く
+        sub["callback"](None, None, "/stream/u1", None, "PipeWireStreamAdded",
+                        GLib.Variant("(u)", (75,)))
+        self.assertEqual(len(self.ready), 1)
+        self.assertEqual(self.ready[0].node_id, 75)
+
+        # そのあとに Start の成功応答が届いても Stop してはいけない
+        self.bus.find("Start")[0]["callback"](None, None)
+        self.assertNotIn("Stop", self.bus.methods())
+        self.assertEqual(self.errors, [])
+
+
+class TestTimeoutRace(RecordMonitorTestCase):
+    def test_late_create_reply_stops_the_orphaned_session(self):
+        self.start()
+        create = self.bus.find("CreateSession")[0]
+
+        self.timers.fire()
+        self.assertEqual(len(self.errors), 1)
+
+        # 打ち切った後に CreateSession の応答が届く
+        create["callback"](None, self.reply_object("/session/u1"))
+
+        self.assertNotIn("RecordMonitor", self.bus.methods())
+        self.assertEqual([c["path"] for c in self.bus.find("Stop")],
+                         ["/session/u1"])
+        self.assertEqual(self.ready, [])
+
+    def test_late_record_reply_stops_the_session_and_does_not_start(self):
+        self.start()
+        self.bus.find("CreateSession")[0]["callback"](
+            None, self.reply_object("/session/u1"))
+        record = self.bus.find("RecordMonitor")[0]
+
+        self.timers.fire()
+        self.assertEqual(len(self.errors), 1)
+        # 打ち切り時点で session_path が判明しているので _cleanup が止めている
+        self.assertEqual([c["path"] for c in self.bus.find("Stop")],
+                         ["/session/u1"])
+
+        # 打ち切った後に RecordMonitor の応答が届いても Start しない
+        record["callback"](None, self.reply_object("/stream/u1"))
+        self.assertNotIn("Start", self.bus.methods())
+        self.assertEqual(self.ready, [])
+
+    def test_no_ready_callback_after_timeout(self):
+        self.start()
+        self.timers.fire()
+        self.bus.find("CreateSession")[0]["callback"](
+            None, self.reply_object("/session/u1"))
+        self.assertEqual(self.ready, [])
+        self.assertEqual(len(self.errors), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Run: `python3 -m unittest discover -s tests -t . -v`
+Expected: PASS — 21 tests（Task 1 の 10 + protocol の 6 + mutter の 5）
 
 - [ ] **Step 6: screencast-probe.py を実装**
 
@@ -725,7 +963,7 @@ Expected: `--show` は `Virtual-1` と `DP-1` の両方を position=(0, 0) size=
 
 ```bash
 git add portal_autoapprove/protocol.py portal_autoapprove/mutter.py \
-        screencast-probe.py tests/test_protocol.py
+        screencast-probe.py tests/test_protocol.py tests/test_mutter.py
 git commit -m "screencast-probe: Mutter の ScreenCast に直接セッションを張る探針を追加"
 ```
 
@@ -984,6 +1222,28 @@ class TestIsRustdeskConnected(unittest.TestCase):
         os.makedirs(d)  # cmdline を作らない = 読めないプロセス
         self.assertFalse(policy.is_rustdesk_connected(self.root))
 
+    def test_ignores_unrelated_binary_with_cm_and_rustdesk_in_an_argument(self):
+        # rustdesk という名前のディレクトリを --cm 付きで扱う無関係なコマンド。
+        # 引数への部分一致で通すと、画面キャプチャを無言で承認してしまう。
+        self._add_process(105, ["/usr/bin/somecmd", "--cm",
+                                "/home/user/projects/rustdesk/notes.txt"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_shell_command_mentioning_rustdesk_cm(self):
+        self._add_process(106, ["/bin/bash", "-c", "pgrep -a -f 'rustdesk --cm'"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_accepts_bare_executable_name(self):
+        self._add_process(107, ["rustdesk", "--cm"])
+        self.assertTrue(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_empty_cmdline(self):
+        d = os.path.join(self.root, "108")
+        os.makedirs(d)
+        with open(os.path.join(d, "cmdline"), "wb") as handle:
+            handle.write(b"")
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1040,6 +1300,11 @@ def is_rustdesk_connected(proc_root="/proc"):
 
     RustDesk は接続を受けたときだけ `rustdesk --cm` を起動する。
     proc_root はテストで差し替えるためのもの。
+
+    この関数の True は「画面キャプチャを無言で承認してよい」を意味するため、
+    誤検知は安全上の欠陥になる。実行ファイル名を argv[0] の basename で厳密に
+    照合し、引数のどこかに rustdesk という文字列が現れるだけのプロセス
+    (rustdesk という名前のディレクトリを扱う無関係なコマンド等) は弾く。
     """
     try:
         entries = os.listdir(proc_root)
@@ -1054,9 +1319,11 @@ def is_rustdesk_connected(proc_root="/proc"):
                 argv = handle.read().split(b"\0")
         except OSError:
             continue  # 読んでいる間に消えたプロセス
-        if b"--cm" not in argv:
+        if not argv or not argv[0]:
             continue
-        if any(b"rustdesk" in arg for arg in argv):
+        if os.path.basename(argv[0]) != b"rustdesk":
+            continue
+        if b"--cm" in argv:
             return True
     return False
 ```
@@ -1064,7 +1331,7 @@ def is_rustdesk_connected(proc_root="/proc"):
 - [ ] **Step 4: テストが通ることを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）
 
 - [ ] **Step 5: 実機で `--cm` の検出を確認**
 
@@ -1075,8 +1342,20 @@ python3 -c "from portal_autoapprove import policy; print(policy.is_rustdesk_conn
 ```
 
 Expected: 未接続で `False`、接続中に `True`。
-**接続中でも `False` なら、`pgrep -a -f rustdesk` で実際の cmdline を確認し、
-`--cm` 以外の指標に差し替えること**（設計書 9-1 の未確定事項）。
+
+**実測済みの背景（2026-09-06）:** RustDesk の `--cm` は ScreenCast 要求と**同じ秒**に起動する。
+
+```
+14:04:31  Activating ... org.freedesktop.impl.portal.desktop.gnome   ← ScreenCast 要求
+14:04:31  rustdesk[3420107]: flutter: --cm started
+```
+
+秒未満の順序は不明なので、`CreateSession` の時点で `--cm` がまだ現れていない取りこぼしが
+起こりうる。これは Task 6 の猶予ポーリング（`--policy-grace-ms`）で塞ぐ。
+
+代替案として「`rustdesk` プロセスが ESTABLISHED な TCP 接続を持つか」も実測したが、
+**`rustdesk --server` は未接続でも中継サーバへの接続を張りっぱなし**（`ESTABLISHED=2`）で
+`always` と区別がつかないため不採用。
 
 - [ ] **Step 6: コミット**
 
@@ -1151,18 +1430,18 @@ class Backend:
 
         self._bus.call(self.name, PORTAL_PATH, SCREEN_CAST_IFACE, method,
                        params, REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                       on_done, None)
+                       on_done)
 
     def close_object(self, path, iface):
         """中継先の Session/Request の Close() を呼ぶ。応答は待たない。"""
         self._bus.call(self.name, path, iface, "Close", None, None,
-                       Gio.DBusCallFlags.NONE, -1, None, None, None)
+                       Gio.DBusCallFlags.NONE, -1, None, None)
 
     def subscribe_closed(self, session_path, callback):
         """中継先の Session が閉じたら callback() を呼ぶ。購読 ID を返す。"""
         return self._bus.signal_subscribe(
             self.name, SESSION_IFACE, "Closed", session_path, None,
-            Gio.DBusSignalFlags.NONE, lambda *_args: callback(), None)
+            Gio.DBusSignalFlags.NONE, lambda *_args: callback())
 
     def unsubscribe(self, subscription_id):
         self._bus.signal_unsubscribe(subscription_id)
@@ -1284,7 +1563,7 @@ class ScreenCastBackend:
 
     # ---- ScreenCast インターフェース ----
 
-    def _on_get_property(self, _conn, _sender, _path, _iface, name, _error, _data):
+    def _on_get_property(self, _conn, _sender, _path, _iface, name):
         if name == "AvailableSourceTypes":
             return GLib.Variant("u", AVAILABLE_SOURCE_TYPES)
         if name == "AvailableCursorModes":
@@ -1294,7 +1573,7 @@ class ScreenCastBackend:
         return None
 
     def _on_method_call(self, _conn, _sender, _path, _iface, method, params,
-                        invocation, _data):
+                        invocation):
         if method == "CreateSession":
             self._create_session(params, invocation)
         elif method == "SelectSources":
@@ -1347,7 +1626,7 @@ class ScreenCastBackend:
         self.log.info("session closed: %s", path)
 
     def _on_session_method_call(self, _conn, _sender, path, _iface, method,
-                                _params, invocation, _data):
+                                _params, invocation):
         if method != "Close":
             invocation.return_error_literal(
                 Gio.DBusError.quark(), Gio.DBusError.UNKNOWN_METHOD, method)
@@ -1366,7 +1645,7 @@ class ScreenCastBackend:
             self._on_request_method_call, None, None)
 
     def _on_request_method_call(self, _conn, _sender, path, _iface, method,
-                                _params, invocation, _data):
+                                _params, invocation):
         if method != "Close":
             invocation.return_error_literal(
                 Gio.DBusError.quark(), Gio.DBusError.UNKNOWN_METHOD, method)
@@ -1394,6 +1673,7 @@ xdg-desktop-portal-gnome へそのまま中継する。中継するので「承�
   --auto-approve-when MODE   rustdesk-connected | always | never (既定 rustdesk-connected)
   --retry-seconds N          Mutter の inhibit に対するリトライ上限 (既定 10)
   --fallback-backend NAME    中継先 (既定 gnome)
+  --policy-grace-ms N        rustdesk --cm の出現を待つ猶予 (既定 1500)
 
 停止して元の挙動に戻すには ~/.config/xdg-desktop-portal/gnome-portals.conf を消して
 systemctl --user restart xdg-desktop-portal すればよい。
@@ -1410,6 +1690,7 @@ DEFAULTS = {
     "--auto-approve-when": policy.MODE_RUSTDESK_CONNECTED,
     "--retry-seconds": "10",
     "--fallback-backend": "gnome",
+    "--policy-grace-ms": "1500",
 }
 
 
@@ -1623,7 +1904,7 @@ git commit -m "portal-autoapprove: 全要求を xdp-gnome へ中継するバッ�
 **Interfaces:**
 - Consumes: `policy.decide`, `policy.is_rustdesk_connected`（Task 4）、`mutter.record_monitor`, `mutter.get_current_state`, `mutter.InhibitedError`（Task 2）、`monitors.select_connector`, `monitors.stream_geometry`（Task 1）、`protocol.*`（Task 2）
 - Produces:
-  - `impl.ScreenCastBackend(bus, fallback_backend_name, prefer_connector, mode, retry_seconds)`
+  - `impl.ScreenCastBackend(bus, fallback_backend_name, prefer_connector, mode, retry_seconds, policy_grace_ms)`
   - `impl.Session` に属性 `route`（`"approve"` または `"delegate"`）, `cursor_mode`, `recording` が増える
 
 **設計上の要点:** **判定は `CreateSession` で一度だけ行い、そのセッションの経路を固定する。**
@@ -1679,12 +1960,13 @@ class Session:
 ```python
 class ScreenCastBackend:
     def __init__(self, bus, fallback_backend_name, prefer_connector, mode,
-                 retry_seconds):
+                 retry_seconds, policy_grace_ms):
         self.bus = bus
         self.fallback = proxy.Backend(bus, fallback_backend_name)
         self.prefer_connector = prefer_connector
         self.mode = mode
         self.retry_seconds = retry_seconds
+        self.policy_grace_ms = policy_grace_ms
         self.log = logging.getLogger("portal-autoapprove")
         self._screen_cast_info = Gio.DBusNodeInfo.new_for_xml(SCREEN_CAST_XML)
         self._session_info = Gio.DBusNodeInfo.new_for_xml(SESSION_XML)
@@ -1698,19 +1980,32 @@ class ScreenCastBackend:
 ```python
     def _create_session(self, params, invocation):
         handle, session_handle, app_id, _options = params.unpack()
-        decision = policy.decide(self.mode, policy.is_rustdesk_connected())
-        route = ROUTE_APPROVE if decision.approve else ROUTE_DELEGATE
-        self.log.info('req=CreateSession session=%s app_id="%s" decision=%s reason=%s',
-                      session_handle, app_id, route, decision.reason)
+        deadline = time.monotonic() + self.policy_grace_ms / 1000.0
 
-        self._export_request(handle)
-        self._export_session(session_handle, route, decision.reason)
+        def settle():
+            decision = policy.decide(self.mode, policy.is_rustdesk_connected())
+            if (not decision.approve
+                    and self.mode == policy.MODE_RUSTDESK_CONNECTED
+                    and time.monotonic() < deadline):
+                # rustdesk --cm は ScreenCast 要求と同じ秒に起動する(実測)。要求の方が
+                # わずかに先だっただけの取りこぼしを防ぐため、少し待って見直す。
+                GLib.timeout_add(250, settle)
+                return GLib.SOURCE_REMOVE
 
-        if route == ROUTE_DELEGATE:
-            self.fallback.forward("CreateSession", params, invocation)
-            return
-        invocation.return_value(
-            GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
+            route = ROUTE_APPROVE if decision.approve else ROUTE_DELEGATE
+            self.log.info('req=CreateSession session=%s app_id="%s" decision=%s reason=%s',
+                          session_handle, app_id, route, decision.reason)
+            self._export_request(handle)
+            self._export_session(session_handle, route, decision.reason)
+
+            if route == ROUTE_DELEGATE:
+                self.fallback.forward("CreateSession", params, invocation)
+                return GLib.SOURCE_REMOVE
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
+            return GLib.SOURCE_REMOVE
+
+        settle()
 ```
 
 `_export_session` のシグネチャを合わせる:
@@ -1814,13 +2109,14 @@ class ScreenCastBackend:
         "org.freedesktop.impl.portal.desktop.%s" % opts["--fallback-backend"],
         opts["--prefer-connector"],
         opts["--auto-approve-when"],
-        int(opts["--retry-seconds"]))
+        int(opts["--retry-seconds"]),
+        int(opts["--policy-grace-ms"]))
 ```
 
 - [ ] **Step 7: 単体テストが壊れていないことを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests（impl.py に単体テストは無いが、純関数モジュールが壊れていないこと）
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）（impl.py に単体テストは無いが、純関数モジュールが壊れていないこと）
 
 - [ ] **Step 8: 実機で自動承認を確認**
 
@@ -1902,7 +2198,7 @@ class Client:
         # パスを問わず Response を購読する。メソッドの戻り値より先に届くことがあるため。
         self.bus.signal_subscribe(
             BUS, REQUEST_IFACE, "Response", None, None,
-            Gio.DBusSignalFlags.NONE, self._on_response, None)
+            Gio.DBusSignalFlags.NONE, self._on_response)
 
     def _on_response(self, _conn, _sender, path, _iface, _signal, params):
         response, results = params.unpack()
@@ -1936,7 +2232,7 @@ class Client:
 
         self.bus.call(BUS, PATH, IFACE, method, params,
                       GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE,
-                      -1, None, on_done, None)
+                      -1, None, on_done)
 
     def fail(self, message):
         self.failure = message
@@ -2067,11 +2363,11 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
         self.select_params = None
 ```
 
-`_create_session` の承認分岐で保存する（`invocation.return_value(...)` の直前）:
+`_create_session` の `settle()` 内、承認分岐で保存する（`invocation.return_value(...)` の直前）:
 
 ```python
-        session = self._sessions[session_handle]
-        session.create_params = params
+            session = self._sessions[session_handle]
+            session.create_params = params
 ```
 
 `_select_sources` の承認分岐で保存する（`invocation.return_value(...)` の直前）:
@@ -2153,7 +2449,7 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "Start", start_params,
                           proxy.REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                          on_start_done, None)
+                          on_start_done)
 
         def on_create_done(_source, res):
             try:
@@ -2167,17 +2463,17 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "SelectSources",
                           session.select_params, proxy.REPLY_TYPE,
-                          Gio.DBusCallFlags.NONE, -1, None, on_select_done, None)
+                          Gio.DBusCallFlags.NONE, -1, None, on_select_done)
 
         self.bus.call(self.fallback.name, PORTAL_PATH, proxy.SCREEN_CAST_IFACE,
                       "CreateSession", session.create_params, proxy.REPLY_TYPE,
-                      Gio.DBusCallFlags.NONE, -1, None, on_create_done, None)
+                      Gio.DBusCallFlags.NONE, -1, None, on_create_done)
 ```
 
 - [ ] **Step 4: 単体テストが壊れていないことを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）
 
 - [ ] **Step 5: 中継フォールバックを実機で確認**
 
