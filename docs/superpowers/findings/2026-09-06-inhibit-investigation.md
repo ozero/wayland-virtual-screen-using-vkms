@@ -162,3 +162,34 @@ xdg-desktop-portal-gnome は restore に失敗するとダイアログにフォ�
 
 ただし最終判断は RustDesk での通し確認による。連続2回の接続でダイアログが出ないことを
 確認してから、README と handoff に反映して完了とする。それでも出る場合は P0-3（app_id）に進む。
+
+
+---
+
+# 追記: Phase 1 の実機検証（2026-09-06 19:31）
+
+`idle-delay=0` で層1(inhibit)を解消したあと、RustDesk での通し確認により層2(永続化)にも
+我々には直せない原因が2つあることが判明したため、Phase 1（自作 ScreenCast バックエンド）を
+実装した。設計書 8 章の A 案。
+
+## 層2 の2つの原因
+
+1. **restore token が物理モニタの EDID に紐づく。** ミラー構成では論理モニタが1つしかなく、
+   xdg-desktop-portal-gnome はその識別子として DP-1 の EDID
+   (`HPN:HP 27f 4k:3CM02743XR`) を記録する。Virtual-1 の識別子は `unknown:unknown:unknown`。
+   DP-1 はモニタ電源 OFF で消えるため復元が必ず失敗し、毎回ダイアログに落ちる
+2. **xdg-desktop-portal-gnome 46.2-0ubuntu1 が毎回 SIGSEGV する。**
+   `g_object_unref` → `g_type_check_instance_is_fundamentally_a` の use-after-free。
+   画面共有ダイアログを出した直後、セッションを閉じる経路で落ちる。パッケージのバグ
+
+## 自作バックエンドでの結果
+
+```
+成功: node_id=88 position=(0, 0) size=(3840, 2160) source_type=1   exit=0
+req=Start … decision=approve connector=Virtual-1 cursor_mode=2 node_id=88 elapsed=9ms
+ダイアログの回数: 0
+```
+
+**DP-1 が `disconnected`（モニタ電源 OFF）の状態で、ダイアログ無しに 3840x2160 の
+Virtual-1 のストリームが 9ms で返った。** 自作バックエンドは connector を名前で指定するため、
+EDID にも論理モニタの都合にも左右されず、restore token も使わず、SEGV する経路も通らない。
