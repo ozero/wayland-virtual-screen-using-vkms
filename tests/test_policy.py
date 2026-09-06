@@ -38,11 +38,13 @@ class TestIsRustdeskConnected(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.root)
 
-    def _add_process(self, pid, argv):
+    def _add_process(self, pid, argv, exe=None):
         d = os.path.join(self.root, str(pid))
         os.makedirs(d)
         with open(os.path.join(d, "cmdline"), "wb") as f:
             f.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        if exe is not None:
+            os.symlink(exe, os.path.join(d, "exe"))
 
     def test_detects_rustdesk_cm(self):
         self._add_process(101, ["/usr/share/rustdesk/rustdesk", "--cm"])
@@ -86,6 +88,23 @@ class TestIsRustdeskConnected(unittest.TestCase):
         with open(os.path.join(d, "cmdline"), "wb") as handle:
             handle.write(b"")
         self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_accepts_when_exe_resolves_to_rustdesk(self):
+        self._add_process(109, ["/usr/share/rustdesk/rustdesk", "--cm"],
+                          exe="/usr/share/rustdesk/rustdesk")
+        self.assertTrue(policy.is_rustdesk_connected(self.root))
+
+    def test_rejects_spoofed_argv0_when_exe_is_not_rustdesk(self):
+        # argv[0] を "rustdesk" と詐称していても、/proc/<pid>/exe が別の実行ファイルを
+        # 指していれば拒否する。exe は execve で詐称できないので、こちらを信じる。
+        self._add_process(110, ["rustdesk", "--cm"], exe="/usr/bin/evil")
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_falls_back_to_argv0_when_exe_is_unreadable(self):
+        # exe シンボリックリンクを作らない = 読めないプロセス(他ユーザーのプロセス等)。
+        # この場合は argv[0] による判定にフォールバックする。
+        self._add_process(111, ["rustdesk", "--cm"])
+        self.assertTrue(policy.is_rustdesk_connected(self.root))
 
 
 if __name__ == "__main__":

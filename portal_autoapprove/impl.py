@@ -248,6 +248,17 @@ class ScreenCastBackend:
             return
 
         def on_ready(recording):
+            if self._sessions.get(session_handle) is not session:
+                # record_monitor の実行中に Session.Close が来た。ここで止めないと
+                # 誰も所有しない録画が残り、Mutter の Closed も _session_closed に
+                # 吸われて誰も stop できなくなる。
+                recording.stop()
+                self.log.info("req=Start session=%s 記録開始前にセッションが閉じられた",
+                              session_handle)
+                self._release_request(handle)
+                invocation.return_value(
+                    GLib.Variant("(ua{sv})", (protocol.RESPONSE_CANCELLED, {})))
+                return
             session.recording = recording
             recording.connect_closed(lambda: self._session_closed(session_handle))
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -283,6 +294,13 @@ class ScreenCastBackend:
             return GLib.SOURCE_REMOVE
 
         def on_error(exc):
+            if self._sessions.get(session_handle) is not session:
+                self.log.info("req=Start session=%s 失敗したがセッションは既に閉じられている",
+                              session_handle)
+                self._release_request(handle)
+                invocation.return_value(
+                    GLib.Variant("(ua{sv})", (protocol.RESPONSE_CANCELLED, {})))
+                return
             if isinstance(exc, mutter.InhibitedError) and time.monotonic() < deadline:
                 self.log.info("req=Start session=%s inhibited、500ms 後に再試行",
                               session_handle)
@@ -336,10 +354,12 @@ class ScreenCastBackend:
             if response != protocol.RESPONSE_SUCCESS:
                 fail("SelectSources", response)
                 return
+            # Start はダイアログを出しうるので、GDBus の既定値(-1 = 25秒)ではなく
+            # GLib.MAXINT で無制限に待つ(Fix 2、proxy.forward と同じ理由)。
             self.bus.call(self.fallback.name, PORTAL_PATH,
                           proxy.SCREEN_CAST_IFACE, "Start", start_params,
-                          proxy.REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                          on_start_done)
+                          proxy.REPLY_TYPE, Gio.DBusCallFlags.NONE,
+                          GLib.MAXINT, None, on_start_done)
 
         def on_create_done(_source, res):
             try:

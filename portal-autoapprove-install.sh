@@ -5,7 +5,8 @@
 #   bash portal-autoapprove-install.sh --uninstall
 #   bash portal-autoapprove-install.sh --status
 #
-# --install は .portal の設置に sudo を1回だけ使う。それ以外はユーザ権限で完結する。
+# --install と --uninstall は /usr/share 配下の .portal の設置/撤去に sudo を1回だけ
+# 使う。それ以外(--status も含む)はすべてユーザ権限で完結する。
 # MODE は rustdesk-connected(既定) | always | never。
 set -euo pipefail
 
@@ -39,7 +40,7 @@ install_all() {
   cat > "$DBUS_DIR/$NAME.service" <<EOF
 [D-BUS Service]
 Name=$NAME
-Exec=/usr/bin/python3 $REPO/portal-autoapprove.py
+Exec=/usr/bin/python3 $REPO/portal-autoapprove.py --auto-approve-when $MODE
 SystemdService=portal-autoapprove.service
 EOF
 
@@ -59,7 +60,12 @@ RestartSec=1
 EOF
 
   for name in $(conf_names); do
-    cat > "$CONF_DIR/$name" <<EOF
+    f="$CONF_DIR/$name"
+    if [ -f "$f" ] && ! head -1 "$f" | grep -qF "$MARKER"; then
+      cp -a "$f" "$f.bak.$(date +%Y%m%d%H%M%S)"
+      echo "既存の $f を退避しました: $f.bak.*"
+    fi
+    cat > "$f" <<EOF
 $MARKER
 [preferred]
 default=gnome;gtk;

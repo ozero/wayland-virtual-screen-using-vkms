@@ -24,7 +24,9 @@ class Backend:
     def forward(self, method, params, invocation, on_reply=None):
         """ScreenCast のメソッドをそのまま転送し、返り値で invocation に応答する。
 
-        中継先がダイアログを出している間は返らないので timeout は無制限(-1)。
+        中継先がダイアログを出している間は返らないので timeout は GLib.MAXINT
+        (無制限)。GDBus では -1 は「無制限」ではなく既定値(25秒)を意味するため、
+        -1 のままだとダイアログを人間が開いたまま放置すると失敗する。
         on_reply は応答を返し終えたあとに呼ばれる。引数は中継先が返した response
         コード。転送そのものが失敗した場合は None。
         """
@@ -41,8 +43,8 @@ class Backend:
                 on_reply(reply.unpack()[0])
 
         self._bus.call(self.name, PORTAL_PATH, SCREEN_CAST_IFACE, method,
-                       params, REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
-                       on_done)
+                       params, REPLY_TYPE, Gio.DBusCallFlags.NONE,
+                       GLib.MAXINT, None, on_done)
 
     def close_object(self, path, iface):
         """中継先の Session/Request の Close() を呼ぶ。応答は待たない。"""

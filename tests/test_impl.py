@@ -362,6 +362,43 @@ class TestApprovePathTeardown(ApproveTestCase):
         self.assertNotIn(SESSION, self.bus.live_paths())
 
 
+class TestApprovePathClosedWhileRecording(ApproveTestCase):
+    """record_monitor の実行中に Session.Close が来た場合。
+
+    誰も所有しない Mutter の録画が残るのが最悪の結果なので、そこを固定する。
+    """
+
+    def close_session_midflight(self):
+        invocation = FakeInvocation()
+        self.backend._on_session_method_call(None, None, SESSION, None, "Close",
+                                             None, invocation)
+
+    def test_late_on_ready_stops_the_orphaned_recording(self):
+        self.approve_session()
+        start_invocation = self.call_method("Start", start_params())
+        self.close_session_midflight()
+
+        self.on_ready(self.recording)
+
+        self.assertTrue(self.recording.stopped)
+        self.assertEqual(start_invocation.value.unpack()[0],
+                         protocol.RESPONSE_CANCELLED)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+    def test_late_on_error_does_not_create_an_orphan_delegate_session(self):
+        self.approve_session()
+        start_invocation = self.call_method("Start", start_params())
+        self.close_session_midflight()
+        before = len(self.bus.calls)
+
+        self.on_error(RuntimeError("boom"))
+
+        self.assertEqual(len(self.bus.calls), before)   # 中継を始めていない
+        self.assertEqual(start_invocation.value.unpack()[0],
+                         protocol.RESPONSE_CANCELLED)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+
 class RetryDelegateTestCase(ApproveTestCase):
     """InhibitedError のリトライと、リトライ上限超過/その他失敗での中継フォールバック。
 

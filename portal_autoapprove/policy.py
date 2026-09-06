@@ -34,6 +34,20 @@ def decide(mode, rustdesk_connected):
     raise ValueError("未知のモード: %r" % (mode,))
 
 
+def _resolves_to_rustdesk(proc_root, entry):
+    """/proc/<pid>/exe で実行ファイルの実体を確かめる。
+
+    argv[0] は execve で詐称できるので、読めるときは exe を信じる。
+    他ユーザーのプロセスなどで読めない場合は None を返し、呼び出し側は
+    argv[0] による判定に落とす。
+    """
+    try:
+        exe = os.readlink(os.path.join(proc_root, entry, "exe"))
+    except OSError:
+        return None
+    return os.path.basename(exe) == "rustdesk"
+
+
 def is_rustdesk_connected(proc_root="/proc"):
     """rustdesk の Connection Manager (--cm) が動いていれば True。
 
@@ -41,9 +55,12 @@ def is_rustdesk_connected(proc_root="/proc"):
     proc_root はテストで差し替えるためのもの。
 
     この関数の True は「画面キャプチャを無言で承認してよい」を意味するため、
-    誤検知は安全上の欠陥になる。実行ファイル名を argv[0] の basename で厳密に
-    照合し、引数のどこかに rustdesk という文字列が現れるだけのプロセス
-    (rustdesk という名前のディレクトリを扱う無関係なコマンド等) は弾く。
+    誤検知は安全上の欠陥になる。/proc/<pid>/exe はカーネルが解決する実行ファイルの
+    実体で execve では詐称できないため、まずそちらを確かめる。argv[0] は
+    execve(argv0=...) で任意の文字列に詐称できるので、exe が読めるときは信用せず、
+    exe が読めない(他ユーザーのプロセス等)場合にだけ argv[0] の basename に
+    フォールバックする。引数のどこかに rustdesk という文字列が現れるだけの
+    プロセス(rustdesk という名前のディレクトリを扱う無関係なコマンド等)は弾く。
     """
     try:
         entries = os.listdir(proc_root)
@@ -60,8 +77,13 @@ def is_rustdesk_connected(proc_root="/proc"):
             continue  # 読んでいる間に消えたプロセス
         if not argv or not argv[0]:
             continue
-        if os.path.basename(argv[0]) != b"rustdesk":
+        if b"--cm" not in argv:
             continue
-        if b"--cm" in argv:
+        resolved = _resolves_to_rustdesk(proc_root, entry)
+        if resolved is False:
+            continue          # 実体が rustdesk ではない = 詐称
+        if resolved is None and os.path.basename(argv[0]) != b"rustdesk":
+            continue          # exe が読めないので argv[0] で判定する
+        if resolved is True or os.path.basename(argv[0]) == b"rustdesk":
             return True
     return False

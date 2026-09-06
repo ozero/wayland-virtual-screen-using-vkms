@@ -344,6 +344,16 @@ RustDesk ─▶ xdp ─▶ 自作デーモン ─┤
 `AvailableCursorModes = 7`、`version = 5`。WINDOW / VIRTUAL を名乗らないのは、
 それらを自動承認する設計になっていないため。
 
+この `AvailableSourceTypes` は xdg-desktop-portal が選択中バックエンドの値を
+`org.freedesktop.portal.ScreenCast` の公開プロパティにそのまま反映する。これは
+**マシン上の全アプリが読む値**であり、中継パス(delegate)の要求にも及ぶ。つまり
+このバックエンドを設置している間、ウィンドウ単位の画面共有はマシン全体で
+使えなくなる(Zoom や Meet で「特定のウィンドウだけ共有」を選べない)。モニタ全体の
+共有は使える。撤去すれば戻る。`1` を選んだのは意図的かつ妥当な判断で、承認パスは
+常に `RecordMonitor` を呼ぶため、ここで WINDOW を名乗るとウィンドウを選んだアプリが
+モニタ全体を受け取ってしまう(要求より多く共有してしまう)。だが、この副作用自体は
+記録しておく必要がある。
+
 ### 5.4 画面選択ポリシー
 
 `monitors.py` は `org.gnome.Mutter.DisplayConfig.GetCurrentState` の結果に対して:
@@ -367,8 +377,15 @@ req=Start session=/…/session/1 app_id="" decision=approve reason=rustdesk-cm-r
   connector=Virtual-1 cursor_mode=2 node_id=57 elapsed=180ms
 ```
 
-残る穴は「RustDesk 接続中に別アプリが要求すると通る」ことだけで、ログで事後に必ず
-検出できる。
+承認されるのは「実体が rustdesk の `--cm` プロセスが動いている間に届いた要求」であり、
+その間に別アプリが要求すれば通る(`/proc/<pid>/exe` による実体確認で `argv[0]` の
+詐称は防いでいるが、これは境界を狭めるだけで、境界自体が消えるわけではない)。
+
+監査ログで再構成できるのは「いつ・何が(どの connector が)キャプチャされたか」で
+あって、「どのアプリが」ではない。`app_id` は非サンドボックスのアプリでは常に
+空文字列になるため、同時に複数の承認が走らない限り2つの承認ログ行は区別できない。
+セッションハンドルのプレフィックスは呼び出し元の bus name を含み並行クライアントは
+区別できるが、そのクライアントが終了すればプレフィックス自体の意味も無くなる。
 
 ### 5.6 設定項目
 
@@ -492,8 +509,8 @@ systemctl --user restart xdg-desktop-portal.service
 - **承認範囲**: RustDesk 接続中のみ。それ以外は従来のダイアログに委譲する（5.1）
 - **残存リスク**: RustDesk 接続中に別アプリが要求すると通る。要求元を同定できない
   （2.6）ため原理的に閉じられない
-- **監査**: 全要求を判定理由付きで journal に記録する（5.5）。「いつ・どの経路で画面が
-  取られたか」は事後に必ず追える
+- **監査**: 全要求を判定理由付きで journal に記録する（5.5）。追えるのは「いつ・どの
+  connector が」までで、「どのアプリが」までは追えない
 - **範囲の限定**: 差し替えるのは `org.freedesktop.impl.portal.ScreenCast` のみ。
   FileChooser / Secret / RemoteDesktop 等は GNOME のまま
 - **即時停止**: kill switch で1ファイル削除＋再起動で元通り（5.9）
