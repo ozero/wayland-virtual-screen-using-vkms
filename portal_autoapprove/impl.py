@@ -95,6 +95,12 @@ class Session:
         self.recording = None
         self.registration_id = None
         self.closed_subscription = None
+        # 承認経路で CreateSession/SelectSources に渡された元の引数。Mutter が
+        # 最終的に失敗して中継に切り替えるとき、GNOME バックエンドに対して
+        # CreateSession/SelectSources を最初から張り直すために使う
+        # (承認経路ではこれらを GNOME に送っていないため)。
+        self.create_params = None
+        self.select_params = None
 
     def close(self):
         if self.recording is not None:
@@ -183,6 +189,9 @@ class ScreenCastBackend:
                 return GLib.SOURCE_REMOVE
 
             self._export_session(session_handle, route, decision.reason)
+            # 中継に切り替えることになった場合に GNOME へ張り直せるよう、元の
+            # 引数を覚えておく。
+            self._sessions[session_handle].create_params = params
             invocation.return_value(
                 GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
             self._release_request(handle)
@@ -204,6 +213,9 @@ class ScreenCastBackend:
         session.cursor_mode = options.get("cursor_mode", protocol.CURSOR_MODE_HIDDEN)
         self.log.info("req=SelectSources session=%s cursor_mode=%d",
                       session_handle, session.cursor_mode)
+        # 中継に切り替えることになった場合に GNOME へ張り直せるよう、元の
+        # 引数を覚えておく。
+        session.select_params = params
         invocation.return_value(
             GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {})))
         self._release_request(handle)
@@ -254,16 +266,99 @@ class ScreenCastBackend:
                 GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, results)))
             self._release_request(handle)
 
+        # Mutter が "Session creation inhibited" を返した場合、期限内なら少し待って
+        # 再試行する。RustDesk は接続時に uinput で入力を注入するので、画面ブランク
+        # 由来の inhibit ならこの待ちの間に解除されることがある(実機で確認済み。
+        # 現在は idle-delay=0 で inhibit 自体が起きないようにしてあるので保険)。
+        # 再試行の余地が無い、または InhibitedError 以外の失敗なら、無人運用の
+        # マシンで「拒否」のままハード失敗させないよう、GNOME バックエンドへの
+        # 中継(=従来どおりダイアログ)に切り替える。
+        deadline = time.monotonic() + self.retry_seconds
+
+        def attempt():
+            mutter.record_monitor(self.bus, connector, session.cursor_mode,
+                                  on_ready, on_error)
+            return GLib.SOURCE_REMOVE
+
         def on_error(exc):
-            self.log.error('req=Start session=%s app_id="%s" decision=approve '
-                           "connector=%s error=%s", session_handle, app_id,
-                           connector, exc)
+            if isinstance(exc, mutter.InhibitedError) and time.monotonic() < deadline:
+                self.log.info("req=Start session=%s inhibited、500ms 後に再試行",
+                              session_handle)
+                GLib.timeout_add(500, attempt)
+                return
+            self.log.warning('req=Start session=%s app_id="%s" decision=approve '
+                             "connector=%s error=%s → 中継に切り替える",
+                             session_handle, app_id, connector, exc)
+            self._delegate_from_scratch(session, params, invocation, handle)
+
+        attempt()
+
+    def _delegate_from_scratch(self, session, start_params, invocation, handle):
+        """承認に失敗したセッションを GNOME バックエンドへ張り直して中継する。
+
+        承認経路では CreateSession / SelectSources を GNOME に送っていないので、
+        Start だけ中継しても向こうにセッションが無い。保存しておいた元の引数を
+        順番に流し直してから Start を中継する。どの終了経路でも Request をちょうど
+        1回だけ解放する。
+        """
+        session.route = ROUTE_DELEGATE
+        session.closed_subscription = self.fallback.subscribe_closed(
+            session.path, lambda: self._session_closed(session.path))
+
+        if session.create_params is None or session.select_params is None:
+            self.log.error("session=%s 元の引数が無く中継に切り替えられない",
+                           session.path)
             invocation.return_value(
                 GLib.Variant("(ua{sv})", (protocol.RESPONSE_OTHER, {})))
             self._release_request(handle)
+            return
 
-        mutter.record_monitor(self.bus, connector, session.cursor_mode,
-                              on_ready, on_error)
+        def fail(stage, response):
+            self.log.error("session=%s 中継の %s が response=%d を返した",
+                           session.path, stage, response)
+            invocation.return_value(GLib.Variant("(ua{sv})", (response, {})))
+            self._release_request(handle)
+
+        def on_start_done(_source, res):
+            try:
+                invocation.return_value(self.bus.call_finish(res))
+            except GLib.Error as err:
+                invocation.return_gerror(err)
+            self._release_request(handle)
+
+        def on_select_done(_source, res):
+            try:
+                response = self.bus.call_finish(res).unpack()[0]
+            except GLib.Error as err:
+                invocation.return_gerror(err)
+                self._release_request(handle)
+                return
+            if response != protocol.RESPONSE_SUCCESS:
+                fail("SelectSources", response)
+                return
+            self.bus.call(self.fallback.name, PORTAL_PATH,
+                          proxy.SCREEN_CAST_IFACE, "Start", start_params,
+                          proxy.REPLY_TYPE, Gio.DBusCallFlags.NONE, -1, None,
+                          on_start_done)
+
+        def on_create_done(_source, res):
+            try:
+                response = self.bus.call_finish(res).unpack()[0]
+            except GLib.Error as err:
+                invocation.return_gerror(err)
+                self._release_request(handle)
+                return
+            if response != protocol.RESPONSE_SUCCESS:
+                fail("CreateSession", response)
+                return
+            self.bus.call(self.fallback.name, PORTAL_PATH,
+                          proxy.SCREEN_CAST_IFACE, "SelectSources",
+                          session.select_params, proxy.REPLY_TYPE,
+                          Gio.DBusCallFlags.NONE, -1, None, on_select_done)
+
+        self.bus.call(self.fallback.name, PORTAL_PATH, proxy.SCREEN_CAST_IFACE,
+                      "CreateSession", session.create_params, proxy.REPLY_TYPE,
+                      Gio.DBusCallFlags.NONE, -1, None, on_create_done)
 
     # ---- Session / Request オブジェクト ----
 

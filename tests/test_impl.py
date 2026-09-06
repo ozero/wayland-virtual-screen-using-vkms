@@ -46,9 +46,10 @@ class FakeBus:
         self._next_id += 1
         return i
 
-    def call(self, _name, path, _iface, method, _params, _reply_type, _flags,
+    def call(self, name, path, _iface, method, params, _reply_type, _flags,
              _timeout, _cancellable, callback=None):
-        self.calls.append({"method": method, "path": path, "callback": callback})
+        self.calls.append({"method": method, "path": path, "name": name,
+                           "params": params, "callback": callback})
 
     def call_finish(self, res):
         return res
@@ -316,12 +317,23 @@ class TestApprovePathFailures(ApproveTestCase):
         self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
         self.assertNotIn(REQUEST, self.bus.live_paths())
 
-    def test_record_monitor_error_replies_and_releases(self):
+    def test_non_inhibited_record_monitor_error_delegates_without_retrying(self):
+        """InhibitedError 以外の失敗はリトライせず即座に中継へ切り替わる。
+
+        リトライ/中継フォールバックの本体は TestInhibitedRetry /
+        TestDelegateFallback で検証する。ここでは、承認経路の最終手段が
+        「拒否で終わる」から「中継に切り替える」に変わったことだけを確かめる。
+        """
         self.approve_session()
-        invocation = self.call_method("Start", start_params())
-        self.on_error(RuntimeError("boom"))
-        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
-        self.assertNotIn(REQUEST, self.bus.live_paths())
+        with mock.patch.object(impl.GLib, "timeout_add") as fake_timeout_add:
+            invocation = self.call_method("Start", start_params())
+            self.on_error(RuntimeError("boom"))
+
+        fake_timeout_add.assert_not_called()
+        self.assertEqual(len(self.record_calls), 1)   # 再試行していない
+        self.assertEqual([c["method"] for c in self.bus.calls], ["CreateSession"])
+        self.assertIsNone(invocation.value)
+        self.assertEqual(self.backend._sessions[SESSION].route, impl.ROUTE_DELEGATE)
 
 
 class TestApprovePathTeardown(ApproveTestCase):
@@ -348,6 +360,136 @@ class TestApprovePathTeardown(ApproveTestCase):
 
         self.assertTrue(self.recording.stopped)
         self.assertNotIn(SESSION, self.bus.live_paths())
+
+
+class RetryDelegateTestCase(ApproveTestCase):
+    """InhibitedError のリトライと、リトライ上限超過/その他失敗での中継フォールバック。
+
+    GLib.timeout_add と time.monotonic を差し替えて、実時間を待たずに
+    「500ms 経った」「retry_seconds を使い切った」を決定的に再現する。
+    タイマーの差し替え方は tests/test_mutter.py の FakeTimers を参考にした。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.backend.retry_seconds = 10
+        self.clock = 0.0
+        self.timers = []   # 予約された (interval, callback) のリスト
+
+        def fake_timeout_add(interval, callback):
+            self.timers.append((interval, callback))
+            return len(self.timers)
+
+        clock_patcher = mock.patch.object(impl.time, "monotonic", lambda: self.clock)
+        timer_patcher = mock.patch.object(impl.GLib, "timeout_add", fake_timeout_add)
+        clock_patcher.start()
+        timer_patcher.start()
+        self.addCleanup(clock_patcher.stop)
+        self.addCleanup(timer_patcher.stop)
+
+    def fire_next_timer(self):
+        _interval, callback = self.timers.pop(0)
+        callback()
+
+    def start_session(self, cursor_mode=2):
+        self.approve_session(cursor_mode=cursor_mode)
+        return self.call_method("Start", start_params())
+
+
+class TestInhibitedRetry(RetryDelegateTestCase):
+    def test_retries_after_500ms_and_succeeds_once_no_longer_inhibited(self):
+        invocation = self.start_session()
+        self.assertEqual(len(self.record_calls), 1)
+
+        self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+
+        # まだ中継はしていない。500ms 後の再試行だけが予約されている。
+        self.assertEqual(self.bus.calls, [])
+        self.assertEqual([interval for interval, _cb in self.timers], [500])
+        self.assertIsNone(invocation.value)
+        self.assertIn(REQUEST, self.bus.live_paths())   # まだ解放していない
+
+        self.fire_next_timer()
+        self.assertEqual(len(self.record_calls), 2)   # 再試行された
+
+        self.on_ready(self.recording)
+        response, results = invocation.value.unpack()
+        self.assertEqual(response, protocol.RESPONSE_SUCCESS)
+        self.assertEqual(results["streams"][0][0], self.recording.node_id)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+
+class TestDelegateFallback(RetryDelegateTestCase):
+    def test_retry_limit_exceeded_switches_to_delegate(self):
+        invocation = self.start_session()
+        self.clock = 11.0   # retry_seconds=10 を使い切った
+
+        self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+
+        self.assertEqual(self.timers, [])   # もう再試行は予約しない
+        self.assertEqual([c["method"] for c in self.bus.calls], ["CreateSession"])
+        self.assertEqual(self.backend._sessions[SESSION].route, impl.ROUTE_DELEGATE)
+        self.assertIsNone(invocation.value)
+
+    def test_non_inhibited_error_delegates_immediately_without_retrying(self):
+        self.start_session()
+
+        self.on_error(RuntimeError("boom"))
+
+        self.assertEqual(self.timers, [])
+        self.assertEqual(len(self.record_calls), 1)   # 再試行していない
+        self.assertEqual([c["method"] for c in self.bus.calls], ["CreateSession"])
+
+    def test_delegate_forwards_create_session_then_select_sources_then_start_in_order(self):
+        invocation = self.start_session(cursor_mode=protocol.CURSOR_MODE_METADATA)
+        self.clock = 11.0
+        self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+        session = self.backend._sessions[SESSION]
+
+        self.assertEqual(self.bus.calls[-1]["method"], "CreateSession")
+        self.assertIs(self.bus.calls[-1]["params"], session.create_params)
+        self.bus.calls[-1]["callback"](None, ok_reply())
+
+        self.assertEqual(self.bus.calls[-1]["method"], "SelectSources")
+        self.assertIs(self.bus.calls[-1]["params"], session.select_params)
+        self.bus.calls[-1]["callback"](None, ok_reply())
+
+        self.assertEqual(self.bus.calls[-1]["method"], "Start")
+        final_reply = GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {}))
+        self.bus.calls[-1]["callback"](None, final_reply)
+
+        self.assertEqual(invocation.value.unpack(), (protocol.RESPONSE_SUCCESS, {}))
+
+    def test_request_is_released_exactly_once_across_the_delegated_path(self):
+        invocation = self.start_session()
+        self.clock = 11.0
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+            self.bus.calls[-1]["callback"](None, ok_reply())    # CreateSession
+            self.bus.calls[-1]["callback"](None, ok_reply())    # SelectSources
+            final_reply = GLib.Variant("(ua{sv})", (protocol.RESPONSE_SUCCESS, {}))
+            self.bus.calls[-1]["callback"](None, final_reply)   # Start
+
+        released.assert_called_once_with(REQUEST)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+        self.assertEqual(invocation.value.unpack(), (protocol.RESPONSE_SUCCESS, {}))
+
+    def test_select_sources_failure_stops_the_chain_and_releases_once(self):
+        invocation = self.start_session()
+        self.clock = 11.0
+
+        with mock.patch.object(self.backend, "_release_request",
+                               wraps=self.backend._release_request) as released:
+            self.on_error(impl.mutter.InhibitedError("Session creation inhibited"))
+            self.bus.calls[-1]["callback"](None, ok_reply())       # CreateSession succeeds
+            self.bus.calls[-1]["callback"](None, denied_reply())   # SelectSources fails
+
+        self.assertEqual([c["method"] for c in self.bus.calls],
+                         ["CreateSession", "SelectSources"])   # Start は呼ばれない
+        released.assert_called_once_with(REQUEST)
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_CANCELLED)
 
 
 class TestGracePolling(ImplTestCase):
