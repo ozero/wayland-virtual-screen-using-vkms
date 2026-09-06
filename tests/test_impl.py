@@ -4,10 +4,11 @@
 常駐デーモンに溜まり続ける。にせ bus で登録と解除の対応を数える。
 """
 import unittest
+from unittest import mock
 
 from gi.repository import GLib
 
-from portal_autoapprove import impl, policy
+from portal_autoapprove import impl, policy, protocol
 
 REQUEST = "/org/freedesktop/portal/desktop/request/1_1/t"
 SESSION = "/org/freedesktop/portal/desktop/session/1_1/s"
@@ -86,6 +87,11 @@ def create_params():
 
 def select_params():
     return GLib.Variant("(oosa{sv})", (REQUEST, SESSION, "", {}))
+
+
+def select_params_with_cursor(mode=2):
+    return GLib.Variant("(oosa{sv})", (REQUEST, SESSION, "",
+                                       {"cursor_mode": GLib.Variant("u", mode)}))
 
 
 def start_params():
@@ -209,6 +215,158 @@ class TestScreenCastInterface(ImplTestCase):
         self.assertEqual(
             get(None, None, impl.PORTAL_PATH, None, "version").unpack(), 5)
         self.assertIsNone(get(None, None, impl.PORTAL_PATH, None, "nope"))
+
+
+class FakeRecording:
+    def __init__(self, node_id=77):
+        self.node_id = node_id
+        self.stopped = False
+        self.closed_cb = None
+
+    def connect_closed(self, callback):
+        self.closed_cb = callback
+
+    def stop(self):
+        self.stopped = True
+
+
+class ApproveTestCase(ImplTestCase):
+    """承認経路。mutter と monitors を差し替えて D-Bus 無しで駆動する。"""
+
+    def setUp(self):
+        super().setUp()
+        self.backend.mode = policy.MODE_ALWAYS
+        self.recording = FakeRecording()
+        self.record_calls = []
+        self.on_ready = None
+        self.on_error = None
+
+        def fake_record_monitor(_bus, connector, cursor_mode, on_ready, on_error,
+                                timeout_ms=5000):
+            self.record_calls.append((connector, cursor_mode))
+            self.on_ready, self.on_error = on_ready, on_error
+
+        for target, name, value in (
+                (impl.mutter, "get_current_state", lambda _bus: "state"),
+                (impl.mutter, "record_monitor", fake_record_monitor),
+                (impl.monitors, "select_connector", lambda _s, prefer: prefer),
+                (impl.monitors, "stream_geometry", lambda _s, _c: ((0, 0), (3840, 2160)))):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def approve_session(self, cursor_mode=2):
+        self.call_method("CreateSession", create_params())
+        self.call_method("SelectSources", select_params_with_cursor(cursor_mode))
+        return self.backend._sessions[SESSION]
+
+
+class TestApprovePath(ApproveTestCase):
+    def test_route_is_approve_and_fixed_at_create_session(self):
+        session = self.approve_session()
+        self.assertEqual(session.route, impl.ROUTE_APPROVE)
+        self.assertEqual(self.bus.calls, [])   # 中継はしていない
+
+    def test_start_returns_only_streams_and_releases_the_request(self):
+        self.approve_session(cursor_mode=2)
+        invocation = self.call_method("Start", start_params())
+        self.assertEqual(self.record_calls, [("Virtual-1", 2)])
+
+        self.on_ready(self.recording)
+
+        response, results = invocation.value.unpack()
+        self.assertEqual(response, protocol.RESPONSE_SUCCESS)
+        self.assertEqual(sorted(results), ["streams"])   # restore_data を返さない
+        node_id, props = results["streams"][0]
+        self.assertEqual(node_id, 77)
+        self.assertEqual(props["position"], (0, 0))
+        self.assertEqual(props["size"], (3840, 2160))
+        self.assertEqual(props["source_type"], protocol.SOURCE_TYPE_MONITOR)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+    def test_requested_cursor_mode_is_passed_through(self):
+        self.approve_session(cursor_mode=protocol.CURSOR_MODE_METADATA)
+        self.call_method("Start", start_params())
+        self.assertEqual(self.record_calls[0][1], protocol.CURSOR_MODE_METADATA)
+
+
+class TestApprovePathFailures(ApproveTestCase):
+    def test_replies_and_releases_when_mutter_is_unavailable(self):
+        self.approve_session()
+        with mock.patch.object(impl.mutter, "get_current_state",
+                               side_effect=GLib.Error("mutter unavailable")):
+            invocation = self.call_method("Start", start_params())
+        self.assertEqual(invocation.value.unpack(),
+                         (protocol.RESPONSE_OTHER, {}))
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+    def test_replies_and_releases_when_no_monitor_is_connected(self):
+        self.approve_session()
+        with mock.patch.object(impl.monitors, "select_connector",
+                               side_effect=ValueError("接続中のモニタが1つも無い")):
+            invocation = self.call_method("Start", start_params())
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+    def test_replies_and_releases_when_the_connector_has_no_current_mode(self):
+        self.approve_session()
+        with mock.patch.object(impl.monitors, "stream_geometry",
+                               side_effect=KeyError("Virtual-1")):
+            invocation = self.call_method("Start", start_params())
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+    def test_record_monitor_error_replies_and_releases(self):
+        self.approve_session()
+        invocation = self.call_method("Start", start_params())
+        self.on_error(RuntimeError("boom"))
+        self.assertEqual(invocation.value.unpack()[0], protocol.RESPONSE_OTHER)
+        self.assertNotIn(REQUEST, self.bus.live_paths())
+
+
+class TestApprovePathTeardown(ApproveTestCase):
+    def test_mutter_initiated_close_stops_the_recording(self):
+        self.approve_session()
+        self.call_method("Start", start_params())
+        self.on_ready(self.recording)
+        self.assertIsNotNone(self.recording.closed_cb)
+
+        self.recording.closed_cb()
+
+        self.assertTrue(self.recording.stopped)
+        self.assertIn((SESSION, impl.SESSION_IFACE, "Closed"), self.bus.signals)
+        self.assertNotIn(SESSION, self.bus.live_paths())
+
+    def test_client_close_stops_the_recording(self):
+        self.approve_session()
+        self.call_method("Start", start_params())
+        self.on_ready(self.recording)
+
+        invocation = FakeInvocation()
+        self.backend._on_session_method_call(None, None, SESSION, None, "Close",
+                                             None, invocation)
+
+        self.assertTrue(self.recording.stopped)
+        self.assertNotIn(SESSION, self.bus.live_paths())
+
+
+class TestGracePolling(ImplTestCase):
+    def test_delegates_when_the_grace_period_expires(self):
+        self.backend.mode = policy.MODE_RUSTDESK_CONNECTED
+        self.backend.policy_grace_ms = 0
+        with mock.patch.object(impl.policy, "is_rustdesk_connected",
+                               return_value=False):
+            self.call_method("CreateSession", create_params())
+        self.assertEqual(self.last_forward()["method"], "CreateSession")
+
+    def test_approves_immediately_when_rustdesk_is_connected(self):
+        self.backend.mode = policy.MODE_RUSTDESK_CONNECTED
+        with mock.patch.object(impl.policy, "is_rustdesk_connected",
+                               return_value=True):
+            invocation = self.call_method("CreateSession", create_params())
+        self.assertEqual(invocation.value.unpack(), (protocol.RESPONSE_SUCCESS, {}))
+        self.assertEqual(self.backend._sessions[SESSION].route, impl.ROUTE_APPROVE)
+        self.assertEqual(self.bus.calls, [])
 
 
 if __name__ == "__main__":

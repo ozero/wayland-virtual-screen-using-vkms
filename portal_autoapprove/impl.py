@@ -219,9 +219,19 @@ class ScreenCastBackend:
             return
 
         started = time.monotonic()
-        state = mutter.get_current_state(self.bus)
-        connector = monitors.select_connector(state, self.prefer_connector)
-        position, size = monitors.stream_geometry(state, connector)
+        try:
+            state = mutter.get_current_state(self.bus)
+            connector = monitors.select_connector(state, self.prefer_connector)
+            position, size = monitors.stream_geometry(state, connector)
+        except (GLib.Error, ValueError, KeyError) as exc:
+            # モニタ構成が変わった瞬間などに起こりうる。例外をハンドラの外へ
+            # 逃がすと応答が返らずクライアントがハングし、Request も残る。
+            self.log.error('req=Start session=%s app_id="%s" decision=approve '
+                           "error=%s", session_handle, app_id, exc)
+            self._release_request(handle)
+            invocation.return_value(
+                GLib.Variant("(ua{sv})", (protocol.RESPONSE_OTHER, {})))
+            return
 
         def on_ready(recording):
             session.recording = recording
@@ -274,6 +284,11 @@ class ScreenCastBackend:
         session = self._sessions.pop(path, None)
         if session is None:
             return
+        if session.recording is not None:
+            # Mutter 側から閉じられた場合もここを通る。Recording が持つ Closed の
+            # 購読を外さないとセッションごとに溜まる。stop() は二重呼び出しでも無害。
+            session.recording.stop()
+            session.recording = None
         self.bus.emit_signal(None, path, SESSION_IFACE, "Closed", None)
         if session.closed_subscription is not None:
             self.fallback.unsubscribe(session.closed_subscription)
