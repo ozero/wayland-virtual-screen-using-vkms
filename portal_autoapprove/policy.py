@@ -39,6 +39,11 @@ def is_rustdesk_connected(proc_root="/proc"):
 
     RustDesk は接続を受けたときだけ `rustdesk --cm` を起動する。
     proc_root はテストで差し替えるためのもの。
+
+    この関数の True は「画面キャプチャを無言で承認してよい」を意味するため、
+    誤検知は安全上の欠陥になる。実行ファイル名を argv[0] の basename で厳密に
+    照合し、引数のどこかに rustdesk という文字列が現れるだけのプロセス
+    (rustdesk という名前のディレクトリを扱う無関係なコマンド等) は弾く。
     """
     try:
         entries = os.listdir(proc_root)
@@ -53,8 +58,10 @@ def is_rustdesk_connected(proc_root="/proc"):
                 argv = handle.read().split(b"\0")
         except OSError:
             continue  # 読んでいる間に消えたプロセス
-        if b"--cm" not in argv:
+        if not argv or not argv[0]:
             continue
-        if any(b"rustdesk" in arg for arg in argv):
+        if os.path.basename(argv[0]) != b"rustdesk":
+            continue
+        if b"--cm" in argv:
             return True
     return False

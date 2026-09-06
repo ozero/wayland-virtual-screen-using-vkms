@@ -65,6 +65,28 @@ class TestIsRustdeskConnected(unittest.TestCase):
         os.makedirs(d)  # cmdline を作らない = 読めないプロセス
         self.assertFalse(policy.is_rustdesk_connected(self.root))
 
+    def test_ignores_unrelated_binary_with_cm_and_rustdesk_in_an_argument(self):
+        # rustdesk という名前のディレクトリを --cm 付きで扱う無関係なコマンド。
+        # 引数への部分一致で通すと、画面キャプチャを無言で承認してしまう。
+        self._add_process(105, ["/usr/bin/somecmd", "--cm",
+                                "/home/user/projects/rustdesk/notes.txt"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_shell_command_mentioning_rustdesk_cm(self):
+        self._add_process(106, ["/bin/bash", "-c", "pgrep -a -f 'rustdesk --cm'"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_accepts_bare_executable_name(self):
+        self._add_process(107, ["rustdesk", "--cm"])
+        self.assertTrue(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_empty_cmdline(self):
+        d = os.path.join(self.root, "108")
+        os.makedirs(d)
+        with open(os.path.join(d, "cmdline"), "wb") as handle:
+            handle.write(b"")
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()
