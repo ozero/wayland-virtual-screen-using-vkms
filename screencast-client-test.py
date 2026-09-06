@@ -72,14 +72,45 @@ class Client:
         self.failure = message
         self.loop.quit()
 
+    def close_session(self, session):
+        """作ったセッションを明示的に閉じる。
+
+        プロセスが終われば xdg-desktop-portal が片付けるが、それは非同期なので
+        連続実行したときに前回のセッションを観測しうる。判定装置として
+        決定的にするためここで閉じる。二重に呼んでも害はない。
+        """
+        if session is None:
+            return
+        try:
+            self.bus.call_sync(BUS, session, "org.freedesktop.portal.Session",
+                               "Close", None, None, Gio.DBusCallFlags.NONE,
+                               5000, None)
+        except GLib.Error:
+            pass   # 既に閉じている / 相手が消えている場合は何もしなくてよい
+
 
 def main(argv):
-    cursor_mode = 2
-    if "--cursor" in argv:
-        cursor_mode = int(argv[argv.index("--cursor") + 1])
     if "-h" in argv or "--help" in argv:
         print(__doc__)
         return 0
+
+    cursor_mode = 2
+    if "--cursor" in argv:
+        i = argv.index("--cursor")
+        if i + 1 >= len(argv):
+            print("--cursor には値が必要です (1=hidden 2=embedded 4=metadata)",
+                  file=sys.stderr)
+            return 1
+        try:
+            cursor_mode = int(argv[i + 1])
+        except ValueError:
+            print("--cursor の値が数値ではありません: %r" % argv[i + 1],
+                  file=sys.stderr)
+            return 1
+        if cursor_mode not in (1, 2, 4):
+            print("--cursor は 1(hidden) / 2(embedded) / 4(metadata) のいずれか",
+                  file=sys.stderr)
+            return 1
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     client = Client(bus)
@@ -125,6 +156,7 @@ def main(argv):
 
     GLib.timeout_add_seconds(30, lambda: (client.fail("30秒で応答なし"), False)[1])
     client.loop.run()
+    client.close_session(state.get("session"))
 
     if client.failure:
         print("失敗: %s" % client.failure, file=sys.stderr)
