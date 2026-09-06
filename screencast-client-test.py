@@ -32,7 +32,7 @@ class Client:
         # パスを問わず Response を購読する。メソッドの戻り値より先に届くことがあるため。
         self.bus.signal_subscribe(
             BUS, REQUEST_IFACE, "Response", None, None,
-            Gio.DBusSignalFlags.NONE, self._on_response, None)
+            Gio.DBusSignalFlags.NONE, self._on_response)
 
     def _on_response(self, _conn, _sender, path, _iface, _signal, params):
         response, results = params.unpack()
