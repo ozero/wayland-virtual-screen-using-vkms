@@ -1222,6 +1222,28 @@ class TestIsRustdeskConnected(unittest.TestCase):
         os.makedirs(d)  # cmdline を作らない = 読めないプロセス
         self.assertFalse(policy.is_rustdesk_connected(self.root))
 
+    def test_ignores_unrelated_binary_with_cm_and_rustdesk_in_an_argument(self):
+        # rustdesk という名前のディレクトリを --cm 付きで扱う無関係なコマンド。
+        # 引数への部分一致で通すと、画面キャプチャを無言で承認してしまう。
+        self._add_process(105, ["/usr/bin/somecmd", "--cm",
+                                "/home/user/projects/rustdesk/notes.txt"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_shell_command_mentioning_rustdesk_cm(self):
+        self._add_process(106, ["/bin/bash", "-c", "pgrep -a -f 'rustdesk --cm'"])
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
+    def test_accepts_bare_executable_name(self):
+        self._add_process(107, ["rustdesk", "--cm"])
+        self.assertTrue(policy.is_rustdesk_connected(self.root))
+
+    def test_ignores_empty_cmdline(self):
+        d = os.path.join(self.root, "108")
+        os.makedirs(d)
+        with open(os.path.join(d, "cmdline"), "wb") as handle:
+            handle.write(b"")
+        self.assertFalse(policy.is_rustdesk_connected(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1278,6 +1300,11 @@ def is_rustdesk_connected(proc_root="/proc"):
 
     RustDesk は接続を受けたときだけ `rustdesk --cm` を起動する。
     proc_root はテストで差し替えるためのもの。
+
+    この関数の True は「画面キャプチャを無言で承認してよい」を意味するため、
+    誤検知は安全上の欠陥になる。実行ファイル名を argv[0] の basename で厳密に
+    照合し、引数のどこかに rustdesk という文字列が現れるだけのプロセス
+    (rustdesk という名前のディレクトリを扱う無関係なコマンド等) は弾く。
     """
     try:
         entries = os.listdir(proc_root)
@@ -1292,9 +1319,11 @@ def is_rustdesk_connected(proc_root="/proc"):
                 argv = handle.read().split(b"\0")
         except OSError:
             continue  # 読んでいる間に消えたプロセス
-        if b"--cm" not in argv:
+        if not argv or not argv[0]:
             continue
-        if any(b"rustdesk" in arg for arg in argv):
+        if os.path.basename(argv[0]) != b"rustdesk":
+            continue
+        if b"--cm" in argv:
             return True
     return False
 ```
@@ -1302,7 +1331,7 @@ def is_rustdesk_connected(proc_root="/proc"):
 - [ ] **Step 4: テストが通ることを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）
 
 - [ ] **Step 5: 実機で `--cm` の検出を確認**
 
@@ -2087,7 +2116,7 @@ class ScreenCastBackend:
 - [ ] **Step 7: 単体テストが壊れていないことを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests（impl.py に単体テストは無いが、純関数モジュールが壊れていないこと）
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）（impl.py に単体テストは無いが、純関数モジュールが壊れていないこと）
 
 - [ ] **Step 8: 実機で自動承認を確認**
 
@@ -2444,7 +2473,7 @@ GNOME に送っていないため、いきなり `Start` だけ中継しても G
 - [ ] **Step 4: 単体テストが壊れていないことを確認**
 
 Run: `python3 -m unittest discover -s tests -t . -v`
-Expected: PASS — 26 tests
+Expected: PASS — 35 tests（Task 1-2 の 21 + policy の 14）
 
 - [ ] **Step 5: 中継フォールバックを実機で確認**
 
